@@ -73,6 +73,14 @@ DEFAULT_FUNCTIONS: List[FunctionItem] = [
         label="打开图片",
         payload=None,
     ),
+    # 这个emmm, 不知道啥样呢
+    FunctionItem(
+        id="interactive_segment",
+        item_type=ActionType.ACTION,
+        icon="✂️",
+        label="交互分割",
+        payload=None,
+    ),
     FunctionItem(
         id="sep2",
         item_type=ActionType.SEPARATOR,

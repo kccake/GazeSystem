@@ -3,17 +3,32 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Callable, List
+from typing import Callable, List, Optional, Tuple
 
-from PySide6.QtCore import Qt, Signal
-from PySide6.QtGui import QPixmap
+import numpy as np
+from PySide6.QtCore import QPoint, Qt, Signal
+from PySide6.QtGui import (
+    QBrush,
+    QColor,
+    QImage,
+    QMouseEvent,
+    QPainter,
+    QPen,
+    QPixmap,
+)
 from PySide6.QtWidgets import (
+    QButtonGroup,
     QFrame,
     QHBoxLayout,
     QLabel,
+    QLineEdit,
+    QMessageBox,
+    QProgressDialog,
     QPushButton,
+    QRadioButton,
     QScrollArea,
     QSizePolicy,
+    QSlider,
     QStackedWidget,
     QVBoxLayout,
     QWidget,
@@ -97,6 +112,295 @@ class ImagePage(QWidget):
         self._refresh()
 
 
+class SegmentationLabel(QLabel):
+    """支持点击提示的图片显示组件。"""
+
+    point_added = Signal(float, float, int)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setAlignment(Qt.AlignCenter)
+        self.setStyleSheet("background-color: #1a1a1a;")
+        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+
+        self._original_pixmap: Optional[QPixmap] = None
+        self._points: List[Tuple[float, float, int]] = []
+        self._mask: Optional[np.ndarray] = None
+        self._mask_alpha = 128
+        self._current_label = 1
+        self._point_radius = 6
+
+    def set_image(self, pixmap: QPixmap) -> None:
+        self._original_pixmap = pixmap
+        self._points.clear()
+        self._mask = None
+        self._refresh()
+
+    def set_current_label(self, label: int) -> None:
+        self._current_label = label
+
+    def set_mask_alpha(self, alpha: int) -> None:
+        self._mask_alpha = max(0, min(255, alpha))
+        self.update()
+
+    def add_point(self, x: float, y: float, label: int) -> None:
+        self._points.append((x, y, label))
+        self.update()
+
+    def clear_points(self) -> None:
+        self._points.clear()
+        self._mask = None
+        self.update()
+
+    def set_mask(self, mask: Optional[np.ndarray]) -> None:
+        self._mask = mask
+        self.update()
+
+    def get_points_labels(self) -> Tuple[List[Tuple[float, float]], List[int]]:
+        points = [(p[0], p[1]) for p in self._points]
+        labels = [p[2] for p in self._points]
+        return points, labels
+
+    def _compute_geometry(self) -> Tuple[float, QPoint]:
+        if self._original_pixmap is None or self._original_pixmap.isNull():
+            return 1.0, QPoint(0, 0)
+        label_size = self.size()
+        pixmap_size = self._original_pixmap.size()
+        scale = min(
+            label_size.width() / max(1, pixmap_size.width()),
+            label_size.height() / max(1, pixmap_size.height()),
+        )
+        scaled_w = pixmap_size.width() * scale
+        scaled_h = pixmap_size.height() * scale
+        offset_x = int((label_size.width() - scaled_w) / 2)
+        offset_y = int((label_size.height() - scaled_h) / 2)
+        return scale, QPoint(offset_x, offset_y)
+
+    def _refresh(self) -> None:
+        if self._original_pixmap and not self._original_pixmap.isNull():
+            self.setPixmap(self._original_pixmap.scaled(
+                self.size(),
+                Qt.KeepAspectRatio,
+                Qt.FastTransformation,
+            ))
+
+    def mousePressEvent(self, event: QMouseEvent):
+        if self._original_pixmap is None or self._original_pixmap.isNull():
+            super().mousePressEvent(event)
+            return
+
+        scale, offset = self._compute_geometry()
+        img_x = (event.pos().x() - offset.x()) / scale
+        img_y = (event.pos().y() - offset.y()) / scale
+        pixmap_size = self._original_pixmap.size()
+
+        if 0 <= img_x < pixmap_size.width() and 0 <= img_y < pixmap_size.height():
+            self.add_point(img_x, img_y, self._current_label)
+            self.point_added.emit(img_x, img_y, self._current_label)
+
+    def paintEvent(self, event):
+        super().paintEvent(event)
+        if self._original_pixmap is None:
+            return
+
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing)
+        scale, offset = self._compute_geometry()
+
+        if self._mask is not None:
+            mask_pixmap = self._mask_to_pixmap(self._mask, scale)
+            if mask_pixmap is not None:
+                painter.drawPixmap(offset, mask_pixmap)
+
+        for x, y, label in self._points:
+            px = int(x * scale + offset.x())
+            py = int(y * scale + offset.y())
+            color = QColor(0, 255, 0) if label == 1 else QColor(255, 0, 0)
+            painter.setPen(QPen(color, 2))
+            painter.setBrush(QBrush(color))
+            painter.drawEllipse(
+                px - self._point_radius,
+                py - self._point_radius,
+                self._point_radius * 2,
+                self._point_radius * 2,
+            )
+            painter.setPen(QPen(Qt.white, 2))
+            if label == 1:
+                painter.drawLine(px, py - 4, px, py + 4)
+                painter.drawLine(px - 4, py, px + 4, py)
+            else:
+                painter.drawLine(px - 4, py, px + 4, py)
+
+    def _mask_to_pixmap(self, mask: np.ndarray, scale: float) -> Optional[QPixmap]:
+        h, w = mask.shape[:2]
+        rgba = np.zeros((h, w, 4), dtype=np.uint8)
+        rgba[mask > 0] = [0, 255, 0, self._mask_alpha]
+        image = QImage(rgba.data, w, h, w * 4, QImage.Format_RGBA8888).copy()
+        return QPixmap.fromImage(image).scaled(
+            int(self._original_pixmap.width() * scale),
+            int(self._original_pixmap.height() * scale),
+            Qt.KeepAspectRatio,
+            Qt.SmoothTransformation,
+        )
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self._refresh()
+
+
+class SegmentationPage(QWidget):
+    """图片点击提示分割页面。"""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._image_path: Optional[Path] = None
+        self._setup_ui()
+
+    def _setup_ui(self):
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(0)
+
+        toolbar = QWidget()
+        toolbar.setFixedHeight(44)
+        toolbar.setStyleSheet("""
+            QWidget {
+                background-color: #252526;
+                border-bottom: 1px solid #3c3c3c;
+            }
+            QPushButton {
+                background-color: #3c3c3c;
+                color: #ffffff;
+                border: none;
+                border-radius: 4px;
+                padding: 4px 12px;
+                font-size: 13px;
+            }
+            QPushButton:hover { background-color: #505050; }
+            QPushButton:pressed { background-color: #606060; }
+            QRadioButton { color: #cccccc; font-size: 13px; }
+            QLineEdit {
+                background-color: #3c3c3c;
+                color: #ffffff;
+                border: 1px solid #505050;
+                border-radius: 4px;
+                padding: 2px 6px;
+            }
+            QSlider::groove:horizontal {
+                height: 4px;
+                background: #3c3c3c;
+            }
+            QSlider::handle:horizontal {
+                background: #888888;
+                width: 12px;
+                margin: -4px 0;
+            }
+        """)
+        toolbar_layout = QHBoxLayout(toolbar)
+        toolbar_layout.setContentsMargins(8, 4, 8, 4)
+        toolbar_layout.setSpacing(8)
+
+        self.positive_btn = QRadioButton("正样本")
+        self.negative_btn = QRadioButton("负样本")
+        self.positive_btn.setChecked(True)
+        self.mode_group = QButtonGroup(self)
+        self.mode_group.addButton(self.positive_btn, 1)
+        self.mode_group.addButton(self.negative_btn, 0)
+        self.mode_group.idClicked.connect(self._on_mode_changed)
+
+        self.clear_btn = QPushButton("清除点")
+        self.segment_btn = QPushButton("运行分割")
+        self.open_btn = QPushButton("打开图片")
+
+        self.alpha_slider = QSlider(Qt.Horizontal)
+        self.alpha_slider.setRange(0, 255)
+        self.alpha_slider.setValue(128)
+        self.alpha_slider.setFixedWidth(100)
+
+        self.server_input = QLineEdit()
+        self.server_input.setPlaceholderText("服务地址")
+        self.server_input.setFixedWidth(160)
+
+        toolbar_layout.addWidget(self.open_btn)
+        toolbar_layout.addSpacing(12)
+        toolbar_layout.addWidget(self.positive_btn)
+        toolbar_layout.addWidget(self.negative_btn)
+        toolbar_layout.addWidget(self.clear_btn)
+        toolbar_layout.addWidget(self.segment_btn)
+        toolbar_layout.addSpacing(12)
+        toolbar_layout.addWidget(QLabel("透明度:"))
+        toolbar_layout.addWidget(self.alpha_slider)
+        toolbar_layout.addStretch()
+        toolbar_layout.addWidget(QLabel("服务:"))
+        toolbar_layout.addWidget(self.server_input)
+
+        layout.addWidget(toolbar)
+
+        self.label = SegmentationLabel()
+        layout.addWidget(self.label, stretch=1)
+
+        self.status_label = QLabel("请选择图片并点击目标区域")
+        self.status_label.setStyleSheet(
+            "background-color: #1a1a1a; color: #888888; padding: 4px 8px;"
+        )
+        self.status_label.setFixedHeight(26)
+        layout.addWidget(self.status_label)
+
+        self.open_btn.clicked.connect(self._choose_image)
+        self.clear_btn.clicked.connect(self._clear_points)
+        self.segment_btn.clicked.connect(self._request_segment)
+        self.alpha_slider.valueChanged.connect(self.label.set_mask_alpha)
+
+    def set_server_url(self, url: str) -> None:
+        self.server_input.setText(url)
+
+    def get_server_url(self) -> str:
+        return self.server_input.text().strip()
+
+    def load_image(self, path: Path) -> bool:
+        pixmap = QPixmap(str(path))
+        if pixmap.isNull():
+            QMessageBox.warning(self, "提示", f"无法加载图片: {path}")
+            return False
+        self._image_path = path
+        self.label.set_image(pixmap)
+        self.status_label.setText(f"已加载: {path.name}")
+        return True
+
+    def get_image_path(self) -> Optional[Path]:
+        return self._image_path
+
+    def get_points_labels(self) -> Tuple[List[Tuple[float, float]], List[int]]:
+        return self.label.get_points_labels()
+
+    def set_mask(self, mask: Optional[np.ndarray]) -> None:
+        self.label.set_mask(mask)
+
+    def set_status(self, text: str) -> None:
+        self.status_label.setText(text)
+
+    def _on_mode_changed(self, mode_id: int) -> None:
+        self.label.set_current_label(mode_id)
+
+    def _choose_image(self) -> None:
+        file_path, _ = QFileDialog.getOpenFileName(
+            self,
+            "选择图片",
+            str(Path.home()),
+            "图片文件 (*.jpg *.jpeg *.png *.bmp *.webp *.tiff);;所有文件 (*.*)",
+        )
+        if file_path:
+            self.load_image(Path(file_path))
+
+    def _clear_points(self) -> None:
+        self.label.clear_points()
+        self.status_label.setText("已清除点击点")
+
+    def _request_segment(self) -> None:
+        self.segment_btn.setEnabled(False)
+        self.status_label.setText("正在请求后端分割...")
+
+
 class StackedDisplay(QStackedWidget):
     """主显示区：在视频流和图片之间切换。"""
 
@@ -104,14 +408,26 @@ class StackedDisplay(QStackedWidget):
         super().__init__(parent)
         self.stream_page = StreamPage(self)
         self.image_page = ImagePage(self)
+        self.segmentation_page = None # 新加的功能
         self.addWidget(self.stream_page)
         self.addWidget(self.image_page)
+
+    def set_segmentation_page(self, page):
+        """由 MainWindow 注入交互分割页面，避免循环导入。"""
+        if self.segmentation_page is not None:
+            self.removeWidget(self.segmentation_page)
+        self.segmentation_page = page
+        self.addWidget(self.segmentation_page)
 
     def show_stream(self):
         self.setCurrentWidget(self.stream_page)
 
     def show_image(self):
         self.setCurrentWidget(self.image_page)
+
+    def show_segmentation(self):
+        if self.segmentation_page is not None:
+            self.setCurrentWidget(self.segmentation_page)
 
     def set_stream_pixmap(self, pixmap: QPixmap):
         self.stream_page.set_pixmap(pixmap)

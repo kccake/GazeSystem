@@ -6,7 +6,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import List
 
-from PySide6.QtCore import Qt
+from PySide6.QtCore import Qt, QThread
 from PySide6.QtGui import QImage, QKeyEvent, QPixmap
 from PySide6.QtWidgets import (
     QFileDialog,
@@ -20,6 +20,12 @@ from PySide6.QtWidgets import (
 from .config import DEFAULT_FUNCTIONS, DEFAULT_IMAGE_FOLDER, FunctionItem, ActionType
 from .stream_worker import StreamWorker
 from .widgets import ControlBar, SidebarWidget, StackedDisplay, StatusBar
+from .interactive_segment_client import InteractiveSegmentationPage, SegmentationWorker
+
+# 先这么用吧, 后面再说UI弹提示框的事
+# 项目目录下的 masks/ 文件夹
+MASK_DIR = Path(__file__).parent / "masks"  # GazeSystem/masks/
+MASK_DIR.mkdir(parents=True, exist_ok=True)
 
 
 class MainWindow(QMainWindow):
@@ -41,6 +47,7 @@ class MainWindow(QMainWindow):
 
         self._setup_ui()
         self._connect_signals()
+        self._setup_interactive_segmentation() # 新增
         self._start_stream("mock")
 
     def _setup_ui(self):
@@ -173,6 +180,13 @@ class MainWindow(QMainWindow):
         path = self._image_paths[index]
         pixmap = QPixmap(str(path))
         self.display.set_image_pixmap(pixmap)
+
+        # 如果在交互分割模式，同步切换当前图片
+        if self._current_mode == "segmentation":
+            self._segment_worker.close_session()
+            self.segmentation_page.set_paused_state(False) # 将状态set为暂停
+            self.segmentation_page.load_image(path)
+        
         self.status_bar.set_info(f"{index + 1} / {len(self._image_paths)}  {path.name}")
 
     def _show_prev_image(self):
@@ -184,6 +198,126 @@ class MainWindow(QMainWindow):
         if self._image_paths:
             new_index = (self._image_index + 1) % len(self._image_paths)
             self._show_image_at_index(new_index)
+
+    # ------------------------------------------------------------------
+    # 交互式点击分割
+    # ------------------------------------------------------------------
+    # 这个是用来将UI与工作线程之间的信号和槽函数, 不涉及到点击的逻辑
+    def _setup_interactive_segmentation(self):
+        self.segmentation_page = InteractiveSegmentationPage(self)
+        self.display.set_segmentation_page(self.segmentation_page)
+
+        self._segment_worker = SegmentationWorker("http://127.0.0.1:8000")
+        self._segment_thread = QThread(self)
+        self._segment_worker.moveToThread(self._segment_thread)
+        self._segment_thread.start()
+
+        # 工作线程 -> UI
+        self._segment_worker.started.connect(self._on_segment_session_started)
+        self._segment_worker.point_result.connect(self._on_segment_point_result) # 连接到UI的槽函数上,将结果返回到函数上
+        self._segment_worker.paused.connect(self._on_segment_paused)
+        self._segment_worker.resumed.connect(self._on_segment_resumed)
+        self._segment_worker.cleared.connect(self._on_segment_cleared)
+        self._segment_worker.saved.connect(self._on_segment_saved)
+        self._segment_worker.error.connect(self._on_segment_error)
+        self._segment_worker.status.connect(self.segmentation_page.set_status)
+
+        # UI -> 工作线程
+        self.segmentation_page.image_loaded.connect(self._on_segment_image_loaded)
+        self.segmentation_page.point_added.connect(self._on_segment_point_added) # 将交互传入的点给到工作线程的函数
+        self.segmentation_page.clear_requested.connect(self._on_segment_clear_requested)
+        self.segmentation_page.pause_requested.connect(self._on_segment_pause_requested)
+        self.segmentation_page.resume_requested.connect(self._on_segment_resume_requested)
+        self.segmentation_page.save_requested.connect(self._on_segment_save_requested)
+        self.segmentation_page.back_requested.connect(self._exit_interactive_segmentation)
+
+    # 后面又定义了很多函数来去做槽和信号的包装
+    # 用于点击的交互, 这个交互套的是worker和ui, 为后续的点击逻辑做交互
+    def _enter_interactive_segmentation(self):
+        if not self._image_paths:
+            QMessageBox.information(self, "交互分割", "请先打开图片文件夹。")
+            return
+
+        self._stop_stream()
+        self._current_mode = "segmentation"
+        self.status_bar.set_mode("交互分割")
+        self.control_bar.set_mode("image")   # 复用上一张/下一张按钮
+        self.display.show_segmentation()
+        self._show_image_at_index(self._image_index)
+    
+    def _exit_interactive_segmentation(self):
+        self._segment_worker.close_session()
+        self.segmentation_page.set_paused_state(False)
+        self._switch_mode("image")
+        self._show_image_at_index(self._image_index)
+    
+    def _on_segment_image_loaded(self, path: Path):
+        self._segment_worker.close_session()
+        self._segment_worker.set_base_url(self.segmentation_page.get_server_url())
+        self._segment_worker.start_session(str(path))
+
+    def _on_segment_session_started(self, session_id: str):
+        self.segmentation_page.set_status(f"会话已启动: {session_id[:8]}...")
+    
+    def _on_segment_point_added(self, x: float, y: float, label: int):
+        self._segment_worker.add_point(x, y, label)
+
+    def _on_segment_point_result(self, mask, num_points: int, message: str):
+        self.segmentation_page.set_mask(mask)
+        self.segmentation_page.set_status(f"{message} | 点数: {num_points}")
+
+    def _on_segment_clear_requested(self):
+        self._segment_worker.clear()
+    
+    # 这个就有点意义不明了
+    def _on_segment_cleared(self, message: str):
+        self.segmentation_page.clear_local()
+        self.segmentation_page.set_paused_state(False) # 将当前状态设置为暂停
+        self.segmentation_page.set_status(message) # 启动新会话
+
+    # 一个动作会有两个函数, 用于区分动作, _on_segment_pause_requested由UI层发起, 告诉工作线程用户想暂停
+    # 而_on_segment_paused则是由工作线程发起, 接收信号, 通知UI已经暂停了
+    def _on_segment_pause_requested(self):
+        self._segment_worker.pause()
+
+    def _on_segment_paused(self, message: str):
+        self.segmentation_page.set_paused_state(True)
+        self.segmentation_page.set_status(message)
+
+    def _on_segment_resume_requested(self):
+        self._segment_worker.resume()
+    
+    def _on_segment_resumed(self, message: str):
+        self.segmentation_page.set_paused_state(False)
+        self.segmentation_page.set_status(message)
+    
+    def _on_segment_save_requested(self):
+        self._segment_worker.save("mask")
+
+    def _on_segment_saved(self, mask, shape, mask_base64, message):
+        if mask is None:
+            self.segmentation_page.set_status("没有可保存的分割结果")
+            return
+
+        default_name = f"mask_{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}.png"
+        save_path, _ = QFileDialog.getSaveFileName(
+            self,
+            "保存分割掩码",
+            str(MASK_DIR / default_name),
+            "PNG 图片 (*.png);;所有文件 (*.*)",
+        )
+        if not save_path:
+            return
+
+        h, w = mask.shape
+        image = QImage(mask.data, w, h, w, QImage.Format_Grayscale8).copy()
+        if image.save(save_path):
+            self.segmentation_page.set_status(f"掩码已保存: {save_path}")
+        else:
+            self.segmentation_page.set_status("保存失败")
+
+    def _on_segment_error(self, message: str):
+        self.segmentation_page.set_status(f"错误: {message}")
 
     # ------------------------------------------------------------------
     # 通用功能
@@ -199,6 +333,7 @@ class MainWindow(QMainWindow):
             self.display.show_image()
 
     def _on_function_clicked(self, item: FunctionItem):
+        # 这个具体的点击的一系列的触发应该要到widget去看, 主要靠widget.py下的SegmentationLabel.mousePressEvent()接收点击操作
         if item.item_type == ActionType.STREAM_SOURCE:
             self._start_stream(item.payload)
         elif item.item_type == ActionType.IMAGE_FOLDER:
@@ -206,7 +341,10 @@ class MainWindow(QMainWindow):
         elif item.item_type == ActionType.VIDEO_FILE:
             self._open_video_file()
         elif item.item_type == ActionType.ACTION:
-            if item.id == "snapshot":
+            # 新加的交互式分割
+            if item.id == "interactive_segment":
+                self._enter_interactive_segmentation()
+            elif item.id == "snapshot":
                 self._take_snapshot()
             elif item.id == "fullscreen":
                 self._toggle_fullscreen()
@@ -223,6 +361,8 @@ class MainWindow(QMainWindow):
         pixmap: QPixmap | None = None
         if self._current_mode == "stream":
             pixmap = self.display.stream_page.label.pixmap()
+        elif self._current_mode == "segmentation":
+            pixmap = self.segmentation_page.label.grab()
         else:
             pixmap = self.display.image_page.label.pixmap()
 
@@ -265,4 +405,12 @@ class MainWindow(QMainWindow):
 
     def closeEvent(self, event):
         self._stop_stream()
+
+        if getattr(self, "_segment_worker", None) is not None:
+            self._segment_worker.close_session()
+
+        if getattr(self, "_segment_thread", None) is not None:
+            self._segment_thread.quit() # 通知工作线程退出事件循环
+            self._segment_thread.wait(2000) # 多等两秒让线程退出
+
         event.accept()
