@@ -212,7 +212,7 @@ class SAM3ModelManager:
         Args:
             image: PIL Image
             click_points: [(x, y), ...] 像素坐标
-            click_labels: [1, 0, ...] 1=正样本(前景), 0=负样本(背景)
+            click_labels: [1, 0, ...] 1=正样本(前景), -1=负样本(背景)
             width, height: 图片尺寸
         
         Returns:

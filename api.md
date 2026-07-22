@@ -537,3 +537,36 @@ python model_server.py [--port PORT] [--host HOST] [--model-path MODEL_PATH]
 | `--model-path` | `/root/workspace/modelRepo/SAM3` | 模型路径 |
 
 也可通过环境变量配置：`PORT`、`HOST`。
+
+image_prompt.json
+字段	类型	必填	说明
+version	string	是	文件格式版本
+type	string	是	"image"
+groups	array	是	物体组列表
+group_id	int	是	组唯一标识
+points	array	否	点坐标列表 [[x, y], ...]
+labels	array	否	点标签 [1, 0, ...]，1=正样本，0=负样本
+box	array/null	否	框坐标 [x1, y1, x2, y2]
+
+约束：
+
+points 和 labels 长度必须一致
+每组至少有一个 points 或 box
+group_id 唯一
+
+
+字段	类型	必填	说明
+video_prompt.json
+version	string	是	文件格式版本
+type	string	是	"video"
+frames	array	是	帧提示列表
+frame_idx	int	是	帧索引
+groups	array	是	该帧的物体组
+
+约束：
+
+同一 group_id 可以在不同帧出现
+首次出现的帧定义物体，后续帧可 refine
+frame_idx 必须递增
+不可以在同一帧的同一对象上同时传入点和框提示, 这个是Sam3TrackerVideoModel
+独有的约束, 在Sam3TrackerModel上是支持在同一物体上同时传入点提示和框提示的
