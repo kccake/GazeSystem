@@ -7,7 +7,7 @@
 
 运行:
     cd /root/workspace/codeRepo
-    /root/miniconda3/envs/SVD/bin/python server_api/tests/smoke_real.py
+    /root/miniconda3/envs/SVD/bin/python GazeSystem/tests/smoke_real.py
 """
 import sys
 import threading
@@ -19,13 +19,13 @@ import requests
 import uvicorn
 from PIL import Image
 
-from server_api.business.service_layer import SAM3ServiceLayer
-from server_api.api.server import create_app
-from server_api.api.client import Sam3Client, ApiError
+from GazeSystem.business.service_layer import SAM3ServiceLayer
+from GazeSystem.api.server import create_app
+from GazeSystem.api.client import Sam3Client, ApiError
 
 HOST, PORT = "127.0.0.1", 8766
 BASE = f"http://{HOST}:{PORT}"
-ASSETS = "/root/workspace/codeRepo/server_api/assets"
+ASSETS = "/root/workspace/codeRepo/GazeSystem/assets"
 VIDEO_PATH = "/tmp/animals_100.mp4"  # 100 帧 1080p 切片, 避免全片解码 OOM
 
 
