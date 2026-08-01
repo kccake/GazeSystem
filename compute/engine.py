@@ -240,64 +240,24 @@ class VideoTrackerEngine:
             "num_frames": len(video_frames) if video_frames is not None else 0
         }
 
-    def process_frame(self, session, frame: Image.Image) -> Dict:
+    def add_frame(self, session, frame: Image.Image) -> Dict:
         """
-        流式场景：处理单帧(自动添加到 session)
-        这个函数不能单独开启, 需要在有了Prompt的情况下才可以进行
+        流式场景: 只把帧注册进 session(processed_frames), 不编码不追踪
+        视觉特征是惰性的: 首次对该帧 predict_frame 时才编码并按帧缓存, 且计算层推理统一用predict_frame
+        (底层 add_new_frame 见 modeling_sam3_tracker_video.py:304, 仅写 processed_frames)
 
-        0 物体行为: transformers 在 forward 内先 add_new_frame 注册帧、再检查
-        物体数, 因此 0 物体时捕获其 ValueError 并返回空结果 —— 帧正常入库
-        (视觉特征在下次有物体的 forward 时才编码, 无损失), 实现"只加帧不推理"
-
-        返回:
-        - dict: {
-            "mask": torch.Tensor,
-            "shape": tuple,
-          }
+        返回: {"frame_idx": session帧号, "original_size": (h, w)}
         """
-        # TODO(优化): 拆分 add_frame(只编码+入session) / infer_frame(只追踪)
-        # 现状: 推帧与追踪 fused, 服务层"非网格帧加提示"路径会算两遍
-        #   (_push_streaming_frame 算一遍 -> flush 提示 -> predict_frame 再算一遍,
-        #    第一遍结果被覆盖, 浪费一次按物体计费的追踪; 帧编码只付一次, 不重复)
-        # 目标: add_frame 后 flush 提示, 再一次 infer, 省掉中间那遍追踪
-        # 前提: 需确认 transformers SAM3 video 是否暴露"只加帧不推理"入口
-        #  (SAM2 predictor 的 add_new_frame 只提特征, transformers 版待查) T0级的待更新!!!
-
         if self.model is None:
             raise RuntimeError("Video 模型尚未加载")
-        
         inference_session = session["session"]
+        inputs = self.processor(images=frame, return_tensors="pt") # 变为tensor, 但不进行视觉编码
+        frame_idx = inference_session.add_new_frame(
+            inputs.pixel_values[0].to(torch.bfloat16)
+        )
+        return {"frame_idx": frame_idx,
+            "original_size": tuple(inputs.original_sizes[0])}
 
-        # 处理单帧
-        # 对于inputs, 包含pixel_values(torch.Tensor), original_sizes (list[list[float]]) 
-        inputs = self.processor(images=frame, return_tensors="pt")
-
-        # 流式推理
-        try:
-            outputs = self.model(
-                inference_session=inference_session,
-                frame=inputs.pixel_values[0].to(torch.bfloat16),
-            )
-        except ValueError as e:
-            if "No objects are provided" in str(e):
-                # 帧已在 add_new_frame 中注册( 发生在注册之后), 0 物体无掩码
-                return {"masks": None, "shape": (0,), "num_objects": 0}
-            raise
-
-        video_res_masks = self.processor.post_process_masks(
-            [outputs.pred_masks],
-            original_sizes=inputs.original_sizes,
-            binarize=True
-        )[0]
-
-        # video_res_masks 形状: (num_objects, 1, H, W)
-        video_res_masks = video_res_masks.squeeze(1)
-
-        return {
-            "masks": video_res_masks,
-            "shape": video_res_masks.shape,
-            "num_objects": video_res_masks.shape[0],
-        }
     
     def add_prompt(self, session, frame_idx: int, obj_id: int,
                 click_points: Optional[List] = None,
@@ -335,9 +295,9 @@ class VideoTrackerEngine:
 
     def predict_frame(self, session, frame_idx: int) -> Dict:
         """
-        分割视频指定帧(离线模式), 这个只是分割指定的帧, 并不是用来分割整个离线视频的,
-        是要用propagate去分割视频段, 主要是为了分割整个视频, 用predict_frame的结果
-        用于
+        对 session 中已入库的指定帧做追踪推理(流式/离线统一入口)
+        前提: 帧已由 add_frame 注册(流式)或 init_session 载入(离线),
+        提示已由 add_prompt 登记; 调用方需保证物体数 > 0
         
         返回:
         - dict: {
@@ -596,9 +556,9 @@ class SAM3ComputeEngine:
     │   └── predict()          ← 首次/增量推理统一入口
     ├── 视频分割(VideoTrackerEngine)
     │   ├── init_session()     ← 初始化会话
-    │   ├── process_frame()    ← 流式处理单帧
+    │   ├── add_frame()    ← 流式只推帧(不追踪)
     │   ├── add_prompt()       ← 交互式添加提示/文件添加提示
-    │   ├── predict_frame()    ← 离线单帧推理
+    │   ├── predict_frame()    ← 单帧推理(流式/离线统一入口)
     │   └── propagate()        ← 传播推理
     └── 文本分割(TextPromptEngine)
         └── predict()
@@ -644,7 +604,7 @@ class SAM3ComputeEngine:
             "predict_prompt": ("image_tracker", "predict"),
             # 视频分割
             "init_video_session": ("video_tracker", "init_session"),
-            "process_video_frame": ("video_tracker", "process_frame"),
+            "add_video_frame": ("video_tracker", "add_frame"),
             "add_video_prompt": ("video_tracker", "add_prompt"),
             "predict_video_frame": ("video_tracker", "predict_frame"),
             "propagate_video": ("video_tracker", "propagate"),
