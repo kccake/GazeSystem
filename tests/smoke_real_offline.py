@@ -4,7 +4,7 @@
 
 运行:
     cd /root/workspace/codeRepo
-    /root/miniconda3/envs/SVD/bin/python server_api/tests/smoke_real_offline.py
+    /root/miniconda3/envs/SVD/bin/python GazeSystem/tests/smoke_real_offline.py
 """
 import sys
 import threading
@@ -15,9 +15,9 @@ sys.path.insert(0, "/root/workspace/codeRepo")
 import requests
 import uvicorn
 
-from server_api.business.service_layer import SAM3ServiceLayer
-from server_api.api.server import create_app
-from server_api.api.client import Sam3Client
+from GazeSystem.business.service_layer import SAM3ServiceLayer
+from GazeSystem.api.server import create_app
+from GazeSystem.api.client import Sam3Client
 
 HOST, PORT = "127.0.0.1", 8767
 BASE = f"http://{HOST}:{PORT}"

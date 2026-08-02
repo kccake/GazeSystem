@@ -5,7 +5,7 @@
 
 运行:
     cd /root/workspace/codeRepo
-    /root/miniconda3/envs/SVD/bin/python server_api/tests/smoke_real_stream.py
+    /root/miniconda3/envs/SVD/bin/python GazeSystem/tests/smoke_real_stream.py
 """
 import sys
 import threading
@@ -17,9 +17,9 @@ import requests
 import uvicorn
 from PIL import Image
 
-from server_api.business.service_layer import SAM3ServiceLayer
-from server_api.api.server import create_app
-from server_api.api.client import Sam3Client, ApiError
+from GazeSystem.business.service_layer import SAM3ServiceLayer
+from GazeSystem.api.server import create_app
+from GazeSystem.api.client import Sam3Client, ApiError
 
 HOST, PORT = "127.0.0.1", 8768
 BASE = f"http://{HOST}:{PORT}"

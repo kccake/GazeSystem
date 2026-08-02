@@ -955,8 +955,6 @@ class SAM3ServiceLayer:
         流式下提示帧若尚未推入底层(非网格帧), 先补推——提示帧必成关键帧
         这个函数本身的设计就不是给非网格帧用的
         危险函数(待后续优化), 已知三个问题:
-        1. 双算: _push_streaming_frame 推帧时算一遍, flush 提示后 _compute_and_cache
-           再算一遍, 第一遍被覆盖(优化见 engine.process_frame 的 TODO)
         2. 不均匀时间步: 补推使底层帧序列间隔不等(如 0,3,6,7), 记忆注意力的时间
            位置编码信号变脏, 运动剧烈时可能影响精度
         3. 并发窗口: 依赖 last_frame 就是 frame_idx 那一帧, 若路由层并发处理
@@ -969,7 +967,7 @@ class SAM3ServiceLayer:
             raise ValueError(
                 f"只能补推最新帧: frame_idx={frame_idx}, "
                 f"最新={session.received_frame_count - 1}")
-        self._push_streaming_frame(session, session.last_frame)
+        self._push_streaming_frame(session, session.last_frame, track=False) # 补推只注册帧，之后照旧 _flush_dirty_frame → _compute_and_cache，只追踪一次
          
     def add_video_point(self, session_id: str, group_id: int,
                         x: float, y: float, label: int, frame_idx: int) -> Dict:
@@ -1087,6 +1085,8 @@ class SAM3ServiceLayer:
         # 为网格帧
         if session.anchor_frame is None or (client_idx - session.anchor_frame) % session.frame_stride == 0:
             res = self._push_streaming_frame(session, frame) # push了之后会有新的cache和keyframe_result
+
+            # 网格帧推入即追踪，非网格提示帧由_ensure_prompt_frame_pushed 只推不算
             return {"frame_idx": client_idx, "keyframe": True,
                     **self._visible_result(session, client_idx, res)}
 
@@ -1094,18 +1094,23 @@ class SAM3ServiceLayer:
         res = session.keyframe_results[prev] if prev is not None else {"masks": None, "groups": []}
         return {"frame_idx": client_idx, "keyframe": False, "reused_from": prev,
                 **self._visible_result(session, client_idx, res)}
-
-    def _push_streaming_frame(self, session: VideoSession, frame: Image.Image) -> Dict:
-        """把最近收到的一帧推入底层 session 并完成该帧跟踪"""
-        client_idx = session.received_frame_count - 1
-        s_idx = session.pushed_frame_count
-        out = self.compute_engine.process_video_frame(session.video_session, frame)
-        session.stream_c2s[client_idx] = s_idx # 前端映射到后端
-        session.stream_s2c[s_idx] = client_idx # 后端映射到前端
-        session.pushed_frame_count += 1
-        return self._cache_result(session, client_idx,
-                                  out["masks"] if out["num_objects"] > 0 else None)
     
+
+    def _push_streaming_frame(self, session: VideoSession, frame: Image.Image,
+                          track: bool = True) -> Dict:
+        """把最近收到的一帧推入底层 session; track=True 时顺带完成该帧跟踪"""
+        client_idx = session.received_frame_count - 1 # 帧号从0开始计数, received_frame_count是总的接受帧数, 是从1开始计数的
+        add_out = self.compute_engine.add_video_frame(session.video_session, frame)
+        sess_idx = add_out["frame_idx"] # sess_idx是底层SAM3推理会话里的帧号
+        session.stream_c2s[client_idx] = sess_idx # 前端映射到后端
+        session.stream_s2c[sess_idx] = client_idx # 后端映射到前端
+        session.pushed_frame_count += 1
+        if not track or not session.submitted_groups:
+            # 0 物体防护: 底层 frame_idx 路径不查物体数, 空物体会 IndexError, 并且如果选择不做track, 直接跳过计算
+            return self._cache_result(session, client_idx, None)
+        out = self.compute_engine.predict_video_frame(session.video_session, sess_idx)
+        return self._cache_result(session, client_idx, out["masks"])
+
     # ---- 取结果 / 提交计算 ----
     def get_video_frame_result(self, session_id: str, frame_idx: int,
                                compute_if_missing: bool = False) -> Dict:

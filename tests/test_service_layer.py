@@ -9,7 +9,7 @@ import torch
 from PIL import Image
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))  # codeRepo 根
-from server_api.business.service_layer import SAM3ServiceLayer
+from GazeSystem.business.service_layer import SAM3ServiceLayer
 
 
 # ============ 假计算引擎 ============
@@ -41,13 +41,12 @@ class FakeEngine:
             return None
         return torch.stack([torch.full((4, 4), float(oid + 1)) for oid in st.objects])
 
-    def process_video_frame(self, session, frame):
+    def add_video_frame(self, session, frame):
         st = session["session"]
         if st.h is None:
             st.h, st.w = frame.size[1], frame.size[0]
-        m = self._masks(st)
-        return {"masks": m, "num_objects": len(st.objects),
-                "shape": m.shape if m is not None else (0,)}
+        return {"frame_idx": st.num_frames - 1,
+                "original_size": (st.h, st.w)}
 
     def add_video_prompt(self, session, frame_idx, obj_id, click_points=None,
                          click_labels=None, input_boxes=None, original_size=None):
