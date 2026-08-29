@@ -26,7 +26,8 @@ class FakeEngine:
     def __init__(self):
         self.calls = []
 
-    def init_video_session(self, video_frames, video_storage_device=None):
+    def init_video_session(self, video_frames, video_storage_device=None,
+                           frame_store="ram", frame_store_dir=None):
         if video_frames is not None:
             h, w = video_frames[0].size[1], video_frames[0].size[0]
             n = len(video_frames)
@@ -41,11 +42,13 @@ class FakeEngine:
             return None
         return torch.stack([torch.full((4, 4), float(oid + 1)) for oid in st.objects])
 
-    def add_video_frame(self, session, frame):
+    def add_video_frames(self, session, frames):
         st = session["session"]
-        if st.h is None:
-            st.h, st.w = frame.size[1], frame.size[0]
-        return {"frame_idx": st.num_frames - 1,
+        if st.h is None and frames:
+            st.h, st.w = frames[0].size[1], frames[0].size[0]
+        start = st.num_frames
+        st.num_frames += len(frames)
+        return {"frame_indices": list(range(start, start + len(frames))),
                 "original_size": (st.h, st.w)}
 
     def add_video_prompt(self, session, frame_idx, obj_id, click_points=None,
