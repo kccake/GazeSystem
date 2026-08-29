@@ -248,7 +248,11 @@ class SessionManager:
 
     def delete_video_session(self, session_id: str) -> bool:
         with self._lock:
-            if session_id in self.video_sessions:
+            session = self.video_sessions.get(session_id)
+            if session is not None:
+                store = session.video_session["session"].processed_frames
+                if hasattr(store, "close"):
+                    store.close()  # DiskFrameStore: 删除磁盘段文件, 当帧仓为disk时
                 del self.video_sessions[session_id]
                 return True
         return False
@@ -791,23 +795,54 @@ class SAM3ServiceLayer:
         if session is None:
             raise ValueError(f"视频会话 {session_id} 不存在")
         return session
-    
-    def create_video_session(self, video_frames: Optional[List[Image.Image]] = None,
-                             frame_stride: int = 1,
-                             auto_predict: bool = True) -> str:
-        """
-        创建视频会话
-        离线: 传入全部帧; 流式: 传 None, 之后用 push_video_frame 逐帧推入
-        帧统一存 CPU 内存, 计算时再由底层搬上显存, 避免长视频占满显存
-        """
-        compute_session = self.compute_engine.init_video_session(
-            video_frames, video_storage_device="cpu",
-        ) # 由engine创建的推理对象
 
-        return self.session_manager.register_video_session(
-            compute_session, video_frames is None,
-            frame_stride=frame_stride, auto_predict=auto_predict,
+    # 这个写法不在于videos_frames是来自于内存还是硬盘, 区分点还是在于流式还是离线
+    # 这个写法只能在处理RAM OOM的问题上, 相对兼容流式和离线, 但写的还是有问题, 想要
+    # 代码结构完善的话, 还是要等到各个Engine彻底拆分, 并将对应的业务层进行拆分才可以, 
+    # 不然的话, 现在无法有结果
+    
+    def create_video_session(self, video_frames=None, frame_stride=1,
+                         auto_predict=True, chunk_size=32) -> str:
+        """离线(帧已在内存)/流式(传None)"""
+        if video_frames is None:
+            return self._create_from_chunks(None, 0, frame_stride, auto_predict)
+        num = len(video_frames)
+        chunks = (video_frames[s:s + chunk_size] for s in range(0, num, chunk_size))
+        return self._create_from_chunks(chunks, num, frame_stride, auto_predict) # 这样是为了解决显存的OOM问题
+
+    def create_video_session_from_path(self, video_path, frame_stride=1,
+                                   auto_predict=False, chunk_size=32) -> str:
+        """离线长视频: decord 按段解码"""
+        import decord # 这个库是Amazon开发维护的, 专门用来给深度学习用的视频解码库, 原生支持GPU解码, 以及Pytorch, 
+        # 不用像opencv一样手动搞很多步骤
+        vr = decord.VideoReader(video_path) # vr is short for VideoReader
+        num = len(vr)
+        chunks = ([Image.fromarray(f) for f in
+               vr.get_batch(list(range(s, min(s + chunk_size, num)))).asnumpy()] # []内的已经是第二层循环了,得到的是chunk, ([Image1, Image2, ...])
+              for s in range(0, num, chunk_size))
+        return self._create_from_chunks(chunks, num, frame_stride, auto_predict)
+
+    def _create_from_chunks(self, chunk_iter, num_frames, frame_stride, auto_predict) -> str:
+        """
+        唯一实现:注册 + 分批入库
+        离线: 帧仓落盘(safetensors分段), 长视频不占RAM; 流式: 保留内存dict
+        为应对帧的序号在流式的情况下出现乱序的情况, 流式将来要加乱序重排缓冲, 依赖dict的随机写能力
+        """
+        use_disk = chunk_iter is not None
+        compute_session = self.compute_engine.init_video_session(
+            None, video_storage_device='cpu',
+            frame_store="disk" if use_disk else "ram")
+        compute_session["num_frames"] = num_frames
+        sid = self.session_manager.register_video_session(
+            compute_session, chunk_iter is None,
+            frame_stride=frame_stride, auto_predict=auto_predict
         )
+        if chunk_iter is not None:
+            session = self.session_manager.get_video_session(sid) # 开始将帧分批入库
+            for chunk in chunk_iter:
+                out = self.compute_engine.add_video_frames(session.video_session, chunk)
+                session.original_size = out["original_size"]
+        return sid
 
     # ---- group_id 与底层 obj_id 的映射(服务层管 id, 计算层不管) ----
     # 类方法, 不依赖实例状态, 将前端和服务层的对象编号映射到计算层的group_id
@@ -1100,8 +1135,8 @@ class SAM3ServiceLayer:
                           track: bool = True) -> Dict:
         """把最近收到的一帧推入底层 session; track=True 时顺带完成该帧跟踪"""
         client_idx = session.received_frame_count - 1 # 帧号从0开始计数, received_frame_count是总的接受帧数, 是从1开始计数的
-        add_out = self.compute_engine.add_video_frame(session.video_session, frame)
-        sess_idx = add_out["frame_idx"] # sess_idx是底层SAM3推理会话里的帧号
+        add_out = self.compute_engine.add_video_frames(session.video_session, [frame])
+        sess_idx = add_out["frame_indices"][0] # sess_idx是底层SAM3推理会话里的帧号
         session.stream_c2s[client_idx] = sess_idx # 前端映射到后端
         session.stream_s2c[sess_idx] = client_idx # 后端映射到前端
         session.pushed_frame_count += 1

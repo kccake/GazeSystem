@@ -30,19 +30,20 @@ from .protocol import decode_image, pack_mask_bundle
 
 logger = logging.getLogger(__name__)
 
-
-def decode_video_bytes(data: bytes) -> List[Image.Image]:
-    """视频文件字节 -> 全部帧(decord 只认文件路径, 先落临时文件)"""
-    import decord
-    with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as f:
-        f.write(data)
-        path = f.name
-    try:
-        vr = decord.VideoReader(path)
-        batch = vr.get_batch(list(range(len(vr)))).asnumpy()
-        return [Image.fromarray(frame) for frame in batch]
-    finally:
-        os.unlink(path)
+# 现在decode_video_bytes这个被放在了服务层, 
+# 因为要去逐chunk解码视频，需要在api层无感知, 不关心业务细节
+# def decode_video_bytes(data: bytes) -> List[Image.Image]:
+#     """视频文件字节 -> 全部帧(decord 只认文件路径, 先落临时文件)"""
+#     import decord
+#     with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as f:
+#         f.write(data)
+#         path = f.name
+#     try:
+#         vr = decord.VideoReader(path)
+#         batch = vr.get_batch(list(range(len(vr)))).asnumpy()
+#         return [Image.fromarray(frame) for frame in batch]
+#     finally:
+#         os.unlink(path)
 
 
 def create_app(service: SAM3ServiceLayer) -> FastAPI:
@@ -124,22 +125,23 @@ def create_app(service: SAM3ServiceLayer) -> FastAPI:
             auto_predict=payload.get("auto_predict", True))
         return {"session_id": sid, "is_streaming": True}
 
+
     @app.post("/video/sessions/offline")
     async def video_create_offline(body: bytes = Body(...),
                                    frame_stride: int = Query(1),
                                    auto_predict: bool = Query(False)):
-        """
-        离线会话: 整个视频文件一次上传, 服务端解码全部帧
-
-        TODO(v2): 全帧解码驻留内存有硬天花板 —— 实测 46305 帧 x 1080p
-        ≈ 280GB RAM, 直接 OOM。长视频需改硬盘缓存/惰性解码(decord 按帧
-        随机访问, 只缓存近期帧), 现阶段只对短视频(几千帧内)可用
-        """
-        frames = decode_video_bytes(body)
-        sid = service.create_video_session(
-            video_frames=frames, frame_stride=frame_stride,
-            auto_predict=auto_predict)
-        return {"session_id": sid, "is_streaming": False, "num_frames": len(frames)}
+        """离线会话: 视频字节落临时文件, 服务端按段解码入库(内存只占一个 chunk)"""
+        with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as f:
+            f.write(body) # 落在一个临时文件里
+            path = f.name 
+        try:
+            sid = service.create_video_session_from_path(
+                path, frame_stride=frame_stride, auto_predict=auto_predict) # 按照chunk进行读取
+        finally:
+            os.unlink(path)   # 入库完成后即可删, session 不再依赖它
+        return {"session_id": sid, "is_streaming": False,
+                "num_frames": service._get_video_session(sid).frame_count} # 这里的返回比较危险, 但暂时能用
+        
 
     @app.delete("/video/sessions/{sid}")
     def video_close(sid: str):

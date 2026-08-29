@@ -203,7 +203,9 @@ class VideoTrackerEngine:
 
     
     def init_session(self, video_frames: Optional[List[Image.Image]] = None,
-                     video_storage_device: Optional[str] = None) -> Dict:
+                    video_storage_device: Optional[str] = None,
+                    frame_store: str = "ram",
+                    frame_store_dir: Optional[str] = None) -> Dict:
         """
         初始化视频会话(离线/流式统一入口)
 
@@ -228,10 +230,19 @@ class VideoTrackerEngine:
         
         inference_session = self.processor.init_video_session(
             video=video_frames,
-            inference_device=self.device,
-            video_storage_device=video_storage_device, # 用于存储视频帧的模型
+            inference_device=self.device, # 计算发生的位置(vision encoder、memory attention、mask decoder用的设备)
+            inference_state_device='cpu', # 推理产物存放的位置, processed_frames 帧仓（整个视频的预处理帧）的长期存放地
+            video_storage_device=video_storage_device, # processed_frames 帧仓（整个视频的预处理帧）的长期存放地
             dtype=torch.bfloat16, # 与模型权重 dtype 对齐, 帧存储/记忆特征均用 bf16(省一半显存/内存)
         ) # 这个video_frames可以是离线视频, 也可以是视频流, 
+
+        if frame_store == "disk":
+            if video_frames is not None:
+                raise ValueError("disk 帧仓要求分批入库: init 时 video_frames 必须为 None,帧在 init 之后通过 add_frames 逐批追加")
+            from .frame_store import DiskFrameStore
+            # 偷梁换柱: 底层只用到 dict 协议(len/setitem/getitem), 无感知, 这里写的有点trick了, emmm, 不知道需不需要换掉
+            inference_session.processed_frames = DiskFrameStore(
+                store_dir=frame_store_dir)
 
         return {
             "session": inference_session,
@@ -258,7 +269,39 @@ class VideoTrackerEngine:
         return {"frame_idx": frame_idx,
             "original_size": tuple(inputs.original_sizes[0])}
 
-    
+    def add_frames(self, session, frames: List[Image.Image]):
+        """
+        把一批帧注册进 session(流式传 [frame], 离线传一批), 不追踪
+        统一走 video_processor 批处理路径: 与离线原生预处理一致, 批量效率高
+        engine 不认识 chunk: 一次喂多少帧由业务层决定
+        返回: {"frame_indices": List[int], "original_size": (h, w)}
+        """
+        if self.model is None:
+            raise RuntimeError("Video 模型尚未加载")
+        if not frames:
+            raise ValueError("frames 不能为空")
+        inference_session = session["session"]
+        start = (len(inference_session.processed_frames)
+                if inference_session.processed_frames else 0)
+        processed = self.processor.video_processor(
+            videos=frames, device=self.device, return_tensors="pt")
+        pixel_values = processed.pixel_values_videos[0] # (T,C,H,W), 只有这批在显存
+        for i in range(pixel_values.shape[0]):
+            # 内部 .to(CPU, bf16), 这个来自Sam3TrackerVideoInferenceSession类的方法, 
+            # 存放位置由video_storage_device这个参数决定
+            inference_session.add_new_frame(pixel_values[i])
+
+        store = inference_session.processed_frames
+        if hasattr(store, "flush"):
+            store.flush()  # DiskFrameStore: 每批落盘一段, 约束内存 buffer, 且仅在使用disk作为帧仓时使用
+        
+        h, w = processed.original_sizes[0]
+        if session["video_height"] is None: # 首批记录尺寸(engine 自己建的 dict 自己维护)
+            session["video_height"], session["video_width"] = h, w
+
+        return {"frame_indices": list(range(start, start + pixel_values.shape[0])),
+            "original_size": (h, w)}
+        
     def add_prompt(self, session, frame_idx: int, obj_id: int,
                 click_points: Optional[List] = None,
                 click_labels: Optional[List] = None,
@@ -605,6 +648,7 @@ class SAM3ComputeEngine:
             # 视频分割
             "init_video_session": ("video_tracker", "init_session"),
             "add_video_frame": ("video_tracker", "add_frame"),
+            "add_video_frames": ("video_tracker", "add_frames"),
             "add_video_prompt": ("video_tracker", "add_prompt"),
             "predict_video_frame": ("video_tracker", "predict_frame"),
             "propagate_video": ("video_tracker", "propagate"),
