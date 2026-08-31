@@ -34,7 +34,7 @@ class DiskFrameStore:
 
     SEGMENT_FRAMES = 128
 
-    def __init__(self, capcity: int = 0, store_dir = None):
+    def __init__(self, store_dir = None):
         self._dir = store_dir or os.environ.get(
             "GAZE_FRAME_STORE_DIR") or tempfile.gettempdir()
         os.makedirs(self._dir, exist_ok=True)
@@ -46,7 +46,6 @@ class DiskFrameStore:
         self._segments = [] # [(path, frame_count)], 按序, 段文件路径, frame_count => 这个段装了多少帧
         self._handles = {} # path -> safe_open 句柄(复用 mmap), _handles 是"已打开段文件"的缓存，key 是段文件路径，value 是 safe_open 返回的句柄对象
         self._closed = False # 标记这个帧仓是否被关闭, 初始为False, 调用close()后变为True, 不可逆
-        pass
 
     # ---- dict 协议 ----, 让本类"表现得像字典"的方法
     def __len__(self) -> int:
@@ -90,6 +89,7 @@ class DiskFrameStore:
                 if handle is None:
                     # safe_open 内部是 mmap, get_tensor 零拷贝
                     handle = safe_open(path, framework="pt")
+                    self._handles[path] = handle
                 return handle.get_tensor(f"{frame_idx - base:06d}") 
             base += count
         raise IndexError(f"帧 {frame_idx} 段索引异常")  # 理论不可达
@@ -107,13 +107,16 @@ class DiskFrameStore:
         self._buffer.clear() # 将buffer清除
 
     def close(self, delete: bool = True):
-         """关闭并(默认)删除所有段文件, 因为目前frame_store的目的是缓解内存压力, 还不是会话持久化"""
-         if self._closed:
-             return
-         self._closed = True
-         self._handles.clear()
-         self._buffer.clear()
-         if delete:
+        """关闭并(默认)删除所有段文件, 因为目前frame_store的目的是缓解内存压力, 还不是会话持久化"""
+        if self._closed:
+            return
+        if not delete:
+            self.flush() # 持久化路径: 先把 buffer 尾帧落盘
+         
+        self._closed = True
+        self._handles.clear()
+        self._buffer.clear()
+        if delete:
             for path, _ in self._segments:
                 if os.path.exists(path):
                     os.remove(path)
