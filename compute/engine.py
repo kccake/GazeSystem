@@ -359,11 +359,28 @@ class VideoTrackerEngine:
             frame_idx=frame_idx
         )
 
+        # ---- 追踪产物瘦身(两级) ----
+        # 第一级: 当步瘦身。high_res_masks 仅供本步 batched 记忆编码
+        # (底层 modeling 2651 行注释), 存进输出字典后无任何读者, 直接丢弃。
+        # 单帧产物 3.36MB -> 1.42MB
+        for obj_outputs in inference_session.output_dict_per_obj.values():
+            # 遍历每个被追踪对象的输出, output_dict_per_obj 是一个字典，键是对象 ID，值是该对象在各帧的推理结果
+            # non_cond_frame_outputs：存储非条件帧（即模型自动传播预测的普通帧，而非用户点击/标注的关键帧）的输出
+            # .get(frame_idx)：取出指定帧的输出数据
+
+            entry = obj_outputs["non_cond_frame_outputs"].get(frame_idx)
+            if entry is not None:
+                entry.pop("high_res_masks", None)
+
         video_res_masks = self.processor.post_process_masks(
             [outputs.pred_masks],
             original_sizes=[[session["video_height"], session["video_width"]]],
             binarize=True
         )[0]
+
+        # 第二级: 滑窗逐出。memory attention 只用最近6帧+条件帧,
+        # object pointer 只用最近15帧(config 常量), 老输出永不再读
+        self._evict_old_output(inference_session, frame_idx)
 
         # video_res_masks 形状: (num_objects, 1, H, W)
         video_res_masks = video_res_masks.squeeze(1)
@@ -373,6 +390,29 @@ class VideoTrackerEngine:
             "shape": video_res_masks.shape,
             "num_objects": video_res_masks.shape[0],
         }
+
+    def _evict_old_output(self, inference_session, current_frame: int,
+                           keep: int = 32) -> None:
+        '''
+        非条件帧输出滑窗逐出: 只保留最近 keep 帧, 老的整条删除
+
+        依据: 追踪时只读最近15帧的object pointer + 最近6帧的记忆特征
+        (config: max_object_pointers_in_encoder=16, num_maskmem=7), SAM3源码
+        keep=32 留一倍余量。条件帧(cond_frame_outputs)不动
+
+        约束:
+        - 只支持前向追踪(反向追踪会回头读未来的帧, 本方法会破坏它)
+        - 在老帧上补提示会触发从该帧的重追: 若其邻居帧的非条件输出已被逐出,
+          缺失跳过(_gather_memory_frame_outputs:2296 对 None 跳过,
+          _get_object_pointers:2367 用 .get()), 不报错;
+          此时 memory attention 的输入只剩条件帧(时序证据缺失, 掩码可能轻微漂移),
+          随着每帧追踪产生新输出, 记忆特征窗口6帧/指针窗口15帧内重新填满恢复
+        - TODO(第3条engine拆包): 通用部分迁框架策略工具箱, SAM3部分迁适配层
+        '''
+        for obj_outputs in inference_session.output_dict_per_obj.values():
+            non_cond = obj_outputs["non_cond_frame_outputs"] # 得到非条件帧
+            for f in [f for f in non_cond if f < current_frame - keep]:
+                del non_cond[f] # 如果非条件帧距离current_frame大于keep帧, 则被删除
     
     def propagate(self, session, start_frame:int = 0, end_frame: Optional[int]=None):
         """
