@@ -291,6 +291,11 @@ class VideoTrackerEngine:
             # 存放位置由video_storage_device这个参数决定
             inference_session.add_new_frame(pixel_values[i])
 
+        # 竞态修复: add_new_frame 的 D2H 是 non_blocking 异步拷贝, 必须等本批
+        # 拷贝全部完成, 否则下一批 video_processor 复用显存会覆写拷贝源
+        torch.cuda.synchronize(pixel_values.device)
+
+
         store = inference_session.processed_frames
         if hasattr(store, "flush"):
             store.flush()  # DiskFrameStore: 每批落盘一段, 约束内存 buffer, 且仅在使用disk作为帧仓时使用
@@ -739,7 +744,7 @@ class SAM3ComputeEngine:
         gc.collect()
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
-            torch.cuda.synchronize()
+            torch.cuda.synchronize(self.device)
     
     def get_model_status(self) -> Dict:
         """获取当前模型状态"""
