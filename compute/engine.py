@@ -469,6 +469,25 @@ class VideoTrackerEngine:
             "end_frame": end_frame,
             "num_objects": video_segments[start_frame].shape[0] if video_segments else 0,
         }
+
+    def close_session(self, session) -> None:
+        """
+        释放会话资源(生命周期终点)
+        这个session是SAM3在处理视频的时候自带的, 所以在处理视频的时候
+        Engine也要对自己的init_session负责, 需要close掉自己的session, 这样的操作才是对偶的
+        所以close_session也被视为原子操作, 但是这样做也不能保证磁盘泄露问题, 只能是在一定程度上避免
+
+        disk 帧: 关闭句柄并删除全部段文件
+        RAM 帧仓(dict): 无外部资源, 跳过, 随 inference_session 被 GC
+
+        注意(竞态): close_video_session 先 cancel 再调本方法 在途 submit
+        最多再算完当前帧; 离线传播只读不写, 已打开的 mmap 段在 unlink 后
+        仍可读(Linux语义), 唯一风险是该帧恰好首读未打开的段 →NotFoundError,
+        此时前端已关闭会话, 异常随 WS 断开消化, 可接受
+        """
+        store = session["session"].processed_frames
+        if hasattr(store, "close"):
+            store.close(delete=True)
     
     def remove_object(self, session, obj_id: int) -> bool:
         """
@@ -700,6 +719,7 @@ class SAM3ComputeEngine:
             "remove_video_object": ("video_tracker", "remove_object"),
             "remove_video_object_inputs": ("video_tracker", "remove_object_inputs"),
             "clear_video_objects": ("video_tracker", "clear_objects"),
+            "close_video_session": ("video_tracker", "close_session"),
             # 文本分割
             "predict_text": ("text_prompt", "predict"),
         }
