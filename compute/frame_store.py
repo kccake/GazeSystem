@@ -122,6 +122,13 @@ class DiskFrameStore:
                     os.remove(path)
             self._segments.clear()
 
+    def __del__(self):
+        """GC 兜底: 会话被遗弃/进程退出时尽量删段文件(正常路径是 engine.close_session)"""
+        try:
+            self.close(delete=True)
+        except Exception:
+            pass
+
     @property # 像访问属性一样去访问方法
     def path(self) -> str:
         return self._prefix  # 段文件前缀(测试断言用)

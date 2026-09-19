@@ -39,3 +39,12 @@ env/
 .DS_Store
 Thumbs.db
 target.txt
+
+# 编译缓存(torch.compile / triton 产物, 机器相关不入库)
+.cache/
+
+# 测试视频资产(大文件不入库, 提示 JSON 保留)
+assets/*.mp4
+assets/*.mov
+assets/*.avi
+assets/*.mkv

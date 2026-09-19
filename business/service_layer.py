@@ -1304,11 +1304,13 @@ class SAM3ServiceLayer:
     def close_video_session(self, session_id: str) -> Dict:
         """
         删除整个视频会话(先发出取消信号停掉可能的在途 submit)
-        底层 inference_session 随引用释放, engine 无显式 close 原语
+        engine close_session 原语释放外部资源(disk帧仓段文件),
+        底层 inference_session 本体随引用释放
         """
         session = self.session_manager.get_video_session(session_id)
         if session is None:
             raise ValueError(f"会话 {session_id} 不存在")
         session.cancel_event.set() # 停掉submit
+        self.compute_engine.close_video_session(session.video_session) # 删除帧仓段文件
         self.session_manager.delete_video_session(session_id) # 删除视频会话
         return {"success": True, "message": f"会话 {session_id} 已删除"}
