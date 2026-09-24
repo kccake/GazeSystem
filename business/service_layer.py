@@ -31,7 +31,7 @@ logger = logging.getLogger(__name__)
 
 import sys
 # sys.path.append(str(Path(__file__).parent.parent))
-from ..compute.engine import SAM3ComputeEngine
+from ..compute import SAM3ComputeEngine
 
 # ============ 数据模型 ============
 @dataclass

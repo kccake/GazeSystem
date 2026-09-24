@@ -1,190 +1,24 @@
-"""
-SAM3 纯模型计算层
-与 transformers 的输入输出格式完全一致
-仅进行计算, 不做过多的类型防御
-"""
+"""视频分割引擎: Sam3TrackerVideoModel
 
+本文件是 SAM3 适配层: _evict_old_output 等优化与 SAM3 内部结构
+(output_dict_per_obj、num_maskmem=7 等)深度耦合, 属于适配层实现细节
+"""
 
 import torch
-import numpy as np
 from PIL import Image
 from collections import OrderedDict
 from typing import Optional, Dict, List, Tuple, Any
 
-from transformers import (
-    Sam3Model, SamProcessor,
-    Sam3TrackerModel, Sam3TrackerProcessor,
-    Sam3TrackerVideoModel, Sam3TrackerVideoProcessor
-)
+from transformers import Sam3TrackerVideoModel, Sam3TrackerVideoProcessor
+
+from .base import BaseEngine
 
 
-# ============ 输入校验工具 ============
-# 对于Sam3TrackerProcessor和Sam3TrackerVideoProcessor的形状检测是一致的, 这个是继承的
-def _validate_mask(mask: torch.Tensor) -> None:
-    """校验 mask 形状"""
-    if not isinstance(mask, (torch.LongTensor, torch.FloatTensor, torch.BoolTensor)):
-        raise ValueError(f"mask 必须是 torch.LongTensor/torch.FloatTensor/torch.Bool, 当前 dtype: {mask.dtype}")
-    if mask.ndim != 3:
-        raise ValueError(f"mask 必须是 3D (batch_size, image_size, image_size)，当前: {mask.ndim}D {mask.shape}")
-
-def _validate_points(points: torch.FloatTensor) -> None:
-    """校验 points 形状"""
-    if not isinstance(points, torch.FloatTensor):
-        raise ValueError(f"points 必须是 torch.FloatTensor,当前类型: {type(points)}")
-    if points.ndim != 4:
-        raise ValueError(f"points 必须是 4D (batch_size, point_batch_size, num_points_per_image, 2)，当前: {points.ndim}D {points.shape}")
-    if points.shape[-1] != 2:
-        raise ValueError(f"points 最后一维必须是 2, 当前: {points.shape[-1]}")
-
-
-def _validate_labels(labels: torch.LongTensor, points: torch.FloatTensor) -> None:
-    """校验 labels 形状"""
-    if not isinstance(labels, torch.LongTensor):
-        raise ValueError(f"labels 必须是 torch.LongTensor, 当前类型: {type(labels)}")
-    if labels.ndim != 3:
-        raise ValueError(f"labels 必须是 3D (batch_size, point_batch_size, num_points_per_image)，当前: {labels.ndim}D {labels.shape}")
-    if labels.shape != points.shape[:-1]:
-        raise ValueError(f"labels 形状 {labels.shape} 与 points 形状 {points.shape[:-1]} 不匹配")
-
-
-def _validate_boxes(boxes: torch.FloatTensor) -> None:
-    """校验 boxes 形状"""
-    if not isinstance(boxes, torch.FloatTensor):
-        raise ValueError(f"boxes 必须是 torch.FloatTensor, 当前类型: {type(boxes)}")
-    if boxes.ndim != 3:
-        raise ValueError(f"boxes 必须是 3D (batch_size, num_boxes_per_image, 4)，当前: {boxes.ndim}D {boxes.shape}")
-    if boxes.shape[-1] != 4:
-        raise ValueError(f"boxes 最后一维必须是 4, 当前: {boxes.shape[-1]}")
-
-# ============ 图像分割引擎 ===========
-class ImageTrackerEngine:
-    """Sam3TrackerModel 图像分割引擎"""
-
-    def __init__(self, device: torch.device, model_path: str):
-        self.device = device
-        self.model_path = model_path
-        self.model = None
-        self.processor = None
-
-    def load(self):
-        """加载模型"""
-        if self.model is None:
-            self.model = Sam3TrackerModel.from_pretrained(
-                self.model_path, torch_dtype=torch.bfloat16).to(self.device)
-            self.processor = Sam3TrackerProcessor.from_pretrained(self.model_path)
-    
-    def unload(self):
-        """卸载模型"""
-        if self.model is not None:
-            del self.model
-            del self.processor
-            self.model = None
-            self.processor = None
-    
-    def predict(self, image: Image.Image,
-                click_points: Optional[torch.FloatTensor] = None,
-                click_labels: Optional[torch.LongTensor] = None,
-                input_boxes: Optional[torch.FloatTensor] = None,
-                input_masks: Optional[torch.Tensor] = None,
-                image_embeddings: Optional[torch.Tensor] = None,
-                original_size: Optional[Tuple[int, int]] = None) -> Dict:
-        """
-        图像提示分割(支持首次推理和增量推理)
-
-        参数:
-        - image: PIL.Image(首次推理时必须提供)
-        - click_points: FloatTensor(1, num_objects, num_points, 2)
-        - click_labels: LongTensor(1, num_objects, num_points)
-        - input_boxes: FloatTensor(1, num_objects, 4)
-        - input_masks: LongTensor/FloatTensor(num_objects, H, W) 已二值化
-        - image_embeddings: 首次推理返回的 image_embeddings(提供则跳过 Vision Encoder)
-        - original_size: 由于Image的会话是由服务层完成的, 所以必须要传original_size来解决add_prompt的问题
-        返回:
-        - dict: {
-            "masks": torch.Tensor,      # (num_objects, H, W)
-            "shape": tuple,
-            "num_objects": int,
-            "image_embeddings": torch.Tensor,
-          }
-        """
-        if self.model is None:
-            raise RuntimeError("Tracker 模型尚未加载")
-        
-        # 输入校验
-        if click_points is not None:
-            _validate_points(click_points)
-            if click_labels is None:
-                raise ValueError("提供 click_points 时必须同时提供 click_labels")
-            _validate_labels(click_labels, click_points)
-        if input_boxes is not None:
-            _validate_boxes(input_boxes)
-        if input_masks is not None:
-            _validate_mask(input_masks)
-        
-        # 构建 processor 输入
-        if image_embeddings is None:
-            # 首次推理：需要 image
-            if image is None:
-                raise ValueError("首次推理必须提供 image")
-            processor_kwargs = {"images": image, "return_tensors": 'pt'}
-        else:
-            # 增量推理：不需要 image
-            if original_size is None:
-                raise ValueError("增量推理(复用 image_embeddings)必须提供 original_size")
-            processor_kwargs = {"original_sizes": [list(original_size)], "return_tensors": 'pt'} # 由于SAM3里的processor是以batch处理的,所以要再套一层列表
-
-        if click_points is not None:
-            processor_kwargs["input_points"] = click_points
-        if click_labels is not None:
-            processor_kwargs["input_labels"] = click_labels
-        if input_boxes is not None:
-            processor_kwargs["input_boxes"] = input_boxes
-        
-        inputs = self.processor(**processor_kwargs).to(self.device)
-        # 模型权重为 bfloat16, 浮点输入需对齐 dtype; labels/original_sizes 等整型张量不动
-        for k, v in inputs.items():
-            if isinstance(v, torch.Tensor) and v.is_floating_point():
-                inputs[k] = v.to(torch.bfloat16)
-
-        # 构建模型参数
-        model_kwargs = {}
-        if image_embeddings is not None:
-            model_kwargs["image_embeddings"] = image_embeddings
-        if input_masks is not None:
-            model_kwargs["input_masks"] = input_masks.to(self.device, torch.bfloat16).unsqueeze(1)
-
-        # 推理
-        with torch.no_grad():
-            outputs = self.model(**inputs, **model_kwargs, multimask_output=False)
-
-        # 后处理
-        masks = self.processor.post_process_masks(
-            outputs.pred_masks.cpu(),
-            inputs['original_sizes'],
-            binarize=True
-        )[0]
-
-        # 因为multimask_output=False, 所以channel = 1, 直接squeeze, 使得masks的shape为[num_objects, height, width]
-        # 单物体和多物体masks 形状都是 (num_objects, 1, H, W)
-        masks = masks.squeeze(1)
-
-        return {
-            "masks": masks,
-            "shape": masks.shape,
-            "num_objects": masks.shape[0],
-            "image_embeddings": outputs.image_embeddings,  # 返回给业务层缓存
-        }
-    
-
-# ============ 视频分割引擎 ============
-class VideoTrackerEngine:
+class VideoTrackerEngine(BaseEngine):
     """Sam3TrackerVideoModel 视频分割引擎"""
 
     def __init__(self, device: torch.device, model_path: str):
-        self.device = device
-        self.model_path = model_path
-        self.model = None
-        self.processor = None
+        super().__init__(device, model_path)
 
     def load(self):
         """加载模型"""
@@ -201,11 +35,10 @@ class VideoTrackerEngine:
             self.model = None
             self.processor = None
 
-    
     def init_session(self, video_frames: Optional[List[Image.Image]] = None,
-                    video_storage_device: Optional[str] = None,
-                    frame_store: str = "ram",
-                    frame_store_dir: Optional[str] = None) -> Dict:
+                        video_storage_device: Optional[str] = None,
+                        frame_store: str = "ram",
+                        frame_store_dir: Optional[str] = None) -> Dict:
         """
         初始化视频会话(离线/流式统一入口)
 
@@ -215,7 +48,7 @@ class VideoTrackerEngine:
         参数:
         - video_frames: 全部帧(离线) 或 None(流式)
         - video_storage_device: 视频帧存储设备, None=跟随 inference_device(显存),
-          长视频建议传 "cpu" 节省显存
+            长视频建议传 "cpu" 节省显存
 
         返回:
         - dict: {
@@ -223,11 +56,11 @@ class VideoTrackerEngine:
             "video_height": int,
             "video_width": int,
             "num_frames": int
-          }
+            }
         """
         if self.model is None:
             raise RuntimeError("Video 模型尚未加载")
-        
+
         inference_session = self.processor.init_video_session(
             video=video_frames,
             inference_device=self.device, # 计算发生的位置(vision encoder、memory attention、mask decoder用的设备)
@@ -267,7 +100,7 @@ class VideoTrackerEngine:
             inputs.pixel_values[0].to(torch.bfloat16)
         )
         return {"frame_idx": frame_idx,
-            "original_size": tuple(inputs.original_sizes[0])}
+            "original_size": tuple(inputs.original_sizes[0])}    
 
     def add_frames(self, session, frames: List[Image.Image]):
         """
@@ -306,12 +139,12 @@ class VideoTrackerEngine:
 
         return {"frame_indices": list(range(start, start + pixel_values.shape[0])),
             "original_size": (h, w)}
-        
+    
     def add_prompt(self, session, frame_idx: int, obj_id: int,
-                click_points: Optional[List] = None,
-                click_labels: Optional[List] = None,
-                input_boxes: Optional[List] = None,
-                original_size: Optional[Tuple[int, int]] = None) -> None:
+                    click_points: Optional[List] = None,
+                    click_labels: Optional[List] = None,
+                    input_boxes: Optional[List] = None,
+                    original_size: Optional[Tuple[int, int]] = None) -> None:
         """
         向视频指定帧添加提示(交互式入口), 也可作为细粒度提示的原语
 
@@ -352,7 +185,7 @@ class VideoTrackerEngine:
             "masks": torch.Tensor,      # (num_objects, H, W)
             "shape": tuple,
             "num_objects": int,
-          }
+            }
         """
         if self.model is None:
             raise RuntimeError("Video 模型尚未加载")
@@ -397,7 +230,7 @@ class VideoTrackerEngine:
         }
 
     def _evict_old_output(self, inference_session, current_frame: int,
-                           keep: int = 32) -> None:
+                               keep: int = 32) -> None:
         '''
         非条件帧输出滑窗逐出: 只保留最近 keep 帧, 老的整条删除
 
@@ -408,17 +241,17 @@ class VideoTrackerEngine:
         约束:
         - 只支持前向追踪(反向追踪会回头读未来的帧, 本方法会破坏它)
         - 在老帧上补提示会触发从该帧的重追: 若其邻居帧的非条件输出已被逐出,
-          缺失跳过(_gather_memory_frame_outputs:2296 对 None 跳过,
-          _get_object_pointers:2367 用 .get()), 不报错;
-          此时 memory attention 的输入只剩条件帧(时序证据缺失, 掩码可能轻微漂移),
-          随着每帧追踪产生新输出, 记忆特征窗口6帧/指针窗口15帧内重新填满恢复
-        - TODO(第3条engine拆包): 通用部分迁框架策略工具箱, SAM3部分迁适配层
+            缺失跳过(_gather_memory_frame_outputs:2296 对 None 跳过,
+            _get_object_pointers:2367 用 .get()), 不报错;
+            此时 memory attention 的输入只剩条件帧(时序证据缺失, 掩码可能轻微漂移),
+            随着每帧追踪产生新输出, 记忆特征窗口6帧/指针窗口15帧内重新填满恢复
+        - 归属决策(拆包已完成): 本方法与 SAM3 内部结构深度耦合, 作为适配层, 实现细节留在本文件, 不进 base.py 契约
         '''
         for obj_outputs in inference_session.output_dict_per_obj.values():
             non_cond = obj_outputs["non_cond_frame_outputs"] # 得到非条件帧
             for f in [f for f in non_cond if f < current_frame - keep]:
                 del non_cond[f] # 如果非条件帧距离current_frame大于keep帧, 则被删除
-    
+
     def propagate(self, session, start_frame:int = 0, end_frame: Optional[int]=None):
         """
         传播分割到帧范围(离线模式)
@@ -435,7 +268,7 @@ class VideoTrackerEngine:
             "start_frame": int,
             "end_frame": int,
             "num_objects": int,
-          }
+            }
         """
         if self.model is None:
             raise RuntimeError("Video 模型尚未加载")
@@ -488,7 +321,7 @@ class VideoTrackerEngine:
         store = session["session"].processed_frames
         if hasattr(store, "close"):
             store.close(delete=True)
-    
+
     def remove_object(self, session, obj_id: int) -> bool:
         """
         删除单个被跟踪物体(底层 session 无官方 API, 此处手动删除并重排索引)
@@ -548,7 +381,7 @@ class VideoTrackerEngine:
         if obj_id in inference_session.obj_with_new_inputs:
             inference_session.obj_with_new_inputs.remove(obj_id)
         return True
-    
+
     def remove_object_inputs(self, session, obj_id: int, frame_idx: int) -> bool:
         """
         删除某物体在指定帧的点/框提示及其在该帧的输出(用于清除已提交的提示)
@@ -582,213 +415,4 @@ class VideoTrackerEngine:
             raise RuntimeError("Video 模型尚未加载")
         session["session"].reset_tracking_data()
 
-# ============ 文本分割引擎 ============
-# 这个暂时还比较远, 所以这个代码就只是在这占个位置, 并未经过审核
-class TextPromptEngine:
-    """Sam3Model 文本分割引擎"""
-
-    def __init__(self, device: torch.device, model_path: str):
-        self.device = device
-        self.model_path = model_path
-        self.model = None
-        self.processor = None
-
-    def load(self):
-        """加载模型"""
-        if self.model is None:
-            self.model = Sam3Model.from_pretrained(self.model_path).to(self.device)
-            self.processor = SamProcessor.from_pretrained(self.model_path)
-
-    def unload(self):
-        """卸载模型"""
-        if self.model is not None:
-            del self.model
-            del self.processor
-            self.model = None
-            self.processor = None
-
-    def predict(self, image: Image.Image, text_prompt: str,
-                confidence_threshold: float = 0.5) -> Dict:
-        """
-        文本提示分割
-
-        输入:
-        - image: PIL.Image
-        - text_prompt: str
-        - confidence_threshold: float
-
-        返回:
-        - dict: {
-            "masks": List[torch.Tensor],  # 每个元素 (H, W)
-            "scores": List[float],
-            "num_objects": int,
-          }
-        """
-        if self.model is None:
-            raise RuntimeError("Image 模型尚未加载")
-
-        processor = SamProcessor(self.model, confidence_threshold=confidence_threshold)
-
-        inference_state = processor.set_image(image)
-
-        processor.reset_all_prompts(inference_state)
-        inference_state = processor.set_text_prompt(prompt=text_prompt, state=inference_state)
-
-        masks = inference_state.get('masks', [])
-        scores = inference_state.get('scores', [])
-
-        mask_list = []
-        for mask in masks:
-            if hasattr(mask, 'cpu'):
-                mask_tensor = mask.squeeze(0).cpu()
-            else:
-                mask_tensor = torch.from_numpy(np.array(mask))
-            mask_list.append(mask_tensor)
-
-        return {
-            "masks": mask_list,
-            "scores": [float(s) for s in scores],
-            "num_objects": len(mask_list),
-        }
     
-
-# ============ 主计算引擎 ============
-class SAM3ComputeEngine:
-    """
-    SAM3 计算引擎 - 统一管理多个子引擎
-
-    SAM3ComputeEngine
-    ├── 模型加载/卸载（通用）
-    ├── 图像分割(ImageTrackerEngine)
-    │   └── predict()          ← 首次/增量推理统一入口
-    ├── 视频分割(VideoTrackerEngine)
-    │   ├── init_session()     ← 初始化会话
-    │   ├── add_frame()    ← 流式只推帧(不追踪)
-    │   ├── add_prompt()       ← 交互式添加提示/文件添加提示
-    │   ├── predict_frame()    ← 单帧推理(流式/离线统一入口)
-    │   └── propagate()        ← 传播推理
-    └── 文本分割(TextPromptEngine)
-        └── predict()
-    """
-
-    def __init__(self, 
-                 model_path: str = "/root/workspace/modelRepo/SAM3",
-                 device: str = "cuda:1",
-                 enable_image: bool = False,
-                 enable_tracker: bool = True,
-                 enable_video: bool = False):
-        """
-        初始化 SAM3 计算引擎
-
-        参数:
-        - model_path: 模型路径
-        - device: 计算设备，默认 "cuda:1"(优先 GPU)，可设为 "cpu"
-        - enable_image: 是否启用文本分割模型(Sam3Model)
-        - enable_tracker: 是否启用图像跟踪模型(Sam3TrackerModel)
-        - enable_video: 是否启用视频跟踪模型(Sam3TrackerVideoModel)
-        """
-        self.device = torch.device(device if torch.cuda.is_available() else "cpu")
-        self.model_path = model_path
-
-        # 子引擎（按需初始化并加载）
-        self.image_tracker = None
-        self.video_tracker = None
-        self.text_prompt = None
-
-        if enable_tracker:
-            self.image_tracker = ImageTrackerEngine(self.device, model_path)
-            self.image_tracker.load()
-        if enable_video:
-            self.video_tracker = VideoTrackerEngine(self.device, model_path)
-            self.video_tracker.load()
-        if enable_image:
-            self.text_prompt = TextPromptEngine(self.device, model_path)
-            self.text_prompt.load()
-        
-        # 代理映射：方法名 -> (引擎属性名, 引擎方法名)
-        self._PROXY_MAP = {
-            # 图像分割
-            "predict_prompt": ("image_tracker", "predict"),
-            # 视频分割
-            "init_video_session": ("video_tracker", "init_session"),
-            "add_video_frame": ("video_tracker", "add_frame"),
-            "add_video_frames": ("video_tracker", "add_frames"),
-            "add_video_prompt": ("video_tracker", "add_prompt"),
-            "predict_video_frame": ("video_tracker", "predict_frame"),
-            "propagate_video": ("video_tracker", "propagate"),
-            "remove_video_object": ("video_tracker", "remove_object"),
-            "remove_video_object_inputs": ("video_tracker", "remove_object_inputs"),
-            "clear_video_objects": ("video_tracker", "clear_objects"),
-            "close_video_session": ("video_tracker", "close_session"),
-            # 文本分割
-            "predict_text": ("text_prompt", "predict"),
-        }
-
-    def set_model(self, model_type: str, enabled: bool):
-        """
-        启用或禁用指定模型
-
-        enabled=True: 初始化并加载到显存
-        enabled=False: 从显存卸载并释放
-        """
-        import gc
-
-        if model_type == "tracker":
-            if enabled and self.image_tracker is None:
-                self.image_tracker = ImageTrackerEngine(self.device, self.model_path)
-                self.image_tracker.load()
-            elif not enabled and self.image_tracker is not None:
-                self.image_tracker.unload()
-                del self.image_tracker
-                self.image_tracker = None
-
-        elif model_type == "video":
-            if enabled and self.video_tracker is None:
-                self.video_tracker = VideoTrackerEngine(self.device, self.model_path)
-                self.video_tracker.load()
-            elif not enabled and self.video_tracker is not None:
-                self.video_tracker.unload()
-                del self.video_tracker
-                self.video_tracker = None
-
-        elif model_type == "image":
-            if enabled and self.text_prompt is None:
-                self.text_prompt = TextPromptEngine(self.device, self.model_path)
-                self.text_prompt.load()
-            elif not enabled and self.text_prompt is not None:
-                self.text_prompt.unload()
-                del self.text_prompt
-                self.text_prompt = None
-
-        # 清理显存
-        gc.collect()
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-            torch.cuda.synchronize(self.device)
-    
-    def get_model_status(self) -> Dict:
-        """获取当前模型状态"""
-        return {
-            "image": {
-                "enabled": self.text_prompt is not None,
-            },
-            "tracker": {
-                "enabled": self.image_tracker is not None,
-            },
-            "video": {
-                "enabled": self.video_tracker is not None,
-            },
-            "gpu_memory_gb": torch.cuda.memory_allocated() / 1024 ** 3 if torch.cuda.is_available() else 0
-        }
-
-    def __getattr__(self, name: str):
-        """动态代理到子引擎"""
-        if name in self._PROXY_MAP:
-            attr_name, method_name = self._PROXY_MAP[name] # 这里的attr_name指的就是子Engine
-            engine = getattr(self, attr_name)
-            if engine is None:
-                raise RuntimeError(f"{attr_name} 模型未启用")
-            return getattr(engine, method_name) # 从子引擎去获取方法
-        
-        # 非代理方法，抛出 AttributeError
-        raise AttributeError(f"'{self.__class__.__name__}' object has no attribute '{name}'")
