@@ -92,9 +92,9 @@ class FakeEngine:
 
 
 def make_service():
-    svc = SAM3ServiceLayer(enable_tracker=False, enable_video=False)
-    svc.compute_engine = FakeEngine()
-    return svc
+    # 构造时注入 FakeEngine(拆分后子服务持有引擎引用, 不支持构造后替换)
+    return SAM3ServiceLayer(enable_tracker=False, enable_video=False,
+                            compute_engine=FakeEngine())
 
 
 def make_frames(n=30, size=16):
