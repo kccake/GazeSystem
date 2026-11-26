@@ -89,11 +89,18 @@ class SessionManager:
         return False
 
     def cleanup_expired(self):
+        # 作为daemon线程, 防止用户忘记关闭会话, 服务器资源被持续占用
         current_time = time.time()
         with self._lock:
             for sid in [s for s, v in self.image_sessions.items() if current_time - v.created_at > self.max_age_seconds]:
                 del self.image_sessions[sid]
             for sid in [s for s, v in self.video_sessions.items() if current_time - v.created_at > self.max_age_seconds]:
+                session = self.video_sessions.get(sid)
+                if session is not None:
+                    session.cancel_event.set() # 停掉可能正在途中的submit
+                    store = session.video_session["session"].processed_frames
+                    if hasattr(store, "close"):
+                        store.close()
                 del self.video_sessions[sid]
 
     def get_stats(self) -> Dict:

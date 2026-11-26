@@ -47,6 +47,11 @@ class DiskFrameStore:
         self._handles = {} # path -> safe_open 句柄(复用 mmap), _handles 是"已打开段文件"的缓存，key 是段文件路径，value 是 safe_open 返回的句柄对象
         self._closed = False # 标记这个帧仓是否被关闭, 初始为False, 调用close()后变为True, 不可逆
 
+        import weakref
+        # GC 兜底(替代 __del__): finalize 不依赖对象存活, __del__删除会由于异常被静默吞掉, obj先被回收, 导致del失效
+        self._finalizer = weakref.finalize(self, DiskFrameStore._cleanup, self._segments) #使用_cleanup方法, 对_segment进行清除
+
+
     # ---- dict 协议 ----, 让本类"表现得像字典"的方法
     def __len__(self) -> int:
         return self._len
@@ -114,6 +119,7 @@ class DiskFrameStore:
             self.flush() # 持久化路径: 先把 buffer 尾帧落盘
          
         self._closed = True
+        self._finalizer.detach() # 由GC兜底再次转为close进行清理, 也就是当close被调用时, 不用GC了, 也就是说finalizer只是应对会话被遗弃, 未close这种情况
         self._handles.clear()
         self._buffer.clear()
         if delete:
@@ -122,15 +128,16 @@ class DiskFrameStore:
                     os.remove(path)
             self._segments.clear()
 
-    def __del__(self):
-        """GC 兜底: 会话被遗弃/进程退出时尽量删段文件(正常路径是 engine.close_session)"""
-        try:
-            self.close(delete=True)
-        except Exception:
-            pass
-
     @property # 像访问属性一样去访问方法
     def path(self) -> str:
         return self._prefix  # 段文件前缀(测试断言用)
 
-    
+    @staticmethod
+    def _cleanup(segments) -> None:
+        """finalize 回调: 删除残留段文件(已删的幂等跳过"""
+        for path, _ in segments:
+            try:
+                if os.path.exists(path):
+                    os.remove(path)
+            except OSError:
+                pass     

@@ -229,7 +229,7 @@ class VideoWsHandler:
         action = cmd["action"]
         if action == "add_point":
             return svc.add_video_point(sid, cmd["group_id"], cmd["x"], cmd["y"],
-                                       cmd["label"], cmd["frame_idx"])
+                                        cmd["label"], cmd["frame_idx"])
         if action == "add_box":
             return svc.add_video_box(sid, cmd["group_id"], cmd["x1"], cmd["y1"],
                                      cmd["x2"], cmd["y2"], cmd["frame_idx"])
@@ -244,6 +244,10 @@ class VideoWsHandler:
             return svc.load_video_prompt_file(sid, cmd["file_data"],
                                               cmd.get("merge_mode", "append"))
         if action == "get_frame":
+            # 传播进行中拒绝补算: 补算会另起传播线程, 与后台 submit 并发
+            # predict 同一 inference_session(帧计划交错/前沿乱跳)
+            if self.submit_running and cmd.get("compute_if_missing"):
+                raise ValueError("传播进行中, 请等待完成后再请求未计算的帧")
             return svc.get_video_frame_result(sid, cmd["frame_idx"],
                                               cmd.get("compute_if_missing", False))
         if action == "reset":
