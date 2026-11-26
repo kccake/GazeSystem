@@ -1,0 +1,420 @@
+{
+    "version": "1.0",
+    "type": "video",
+    "frames": [
+        {
+            "frame_idx": 5,
+            "groups": [
+                {
+                    "group_id": 0,
+                    "points": [
+                        [
+                            384.1,
+                            213.3
+                        ]
+                    ],
+                    "labels": [
+                        1
+                    ],
+                    "box": null
+                }
+            ]
+        },
+        {
+            "frame_idx": 21,
+            "groups": [
+                {
+                    "group_id": 0,
+                    "points": [
+                        [
+                            345.5,
+                            188.4
+                        ]
+                    ],
+                    "labels": [
+                        1
+                    ],
+                    "box": null
+                }
+            ]
+        },
+        {
+            "frame_idx": 29,
+            "groups": [
+                {
+                    "group_id": 1,
+                    "points": [
+                        [
+                            79.7,
+                            239.8
+                        ]
+                    ],
+                    "labels": [
+                        0
+                    ],
+                    "box": null
+                }
+            ]
+        },
+        {
+            "frame_idx": 33,
+            "groups": [
+                {
+                    "group_id": 1,
+                    "points": [
+                        [
+                            93.2,
+                            259.3
+                        ]
+                    ],
+                    "labels": [
+                        0
+                    ],
+                    "box": null
+                }
+            ]
+        },
+        {
+            "frame_idx": 36,
+            "groups": [
+                {
+                    "group_id": 1,
+                    "points": [
+                        [
+                            81.0,
+                            263.5
+                        ]
+                    ],
+                    "labels": [
+                        0
+                    ],
+                    "box": null
+                }
+            ]
+        },
+        {
+            "frame_idx": 49,
+            "groups": [
+                {
+                    "group_id": 0,
+                    "points": [
+                        [
+                            394.7,
+                            171.9
+                        ]
+                    ],
+                    "labels": [
+                        1
+                    ],
+                    "box": null
+                }
+            ]
+        },
+        {
+            "frame_idx": 69,
+            "groups": [
+                {
+                    "group_id": 0,
+                    "points": [
+                        [
+                            359.0,
+                            191.8
+                        ]
+                    ],
+                    "labels": [
+                        1
+                    ],
+                    "box": null
+                }
+            ]
+        },
+        {
+            "frame_idx": 90,
+            "groups": [
+                {
+                    "group_id": 0,
+                    "points": [
+                        [
+                            401.0,
+                            200.4
+                        ]
+                    ],
+                    "labels": [
+                        1
+                    ],
+                    "box": null
+                }
+            ]
+        },
+        {
+            "frame_idx": 94,
+            "groups": [
+                {
+                    "group_id": 1,
+                    "points": [
+                        [
+                            493.6,
+                            55.8
+                        ]
+                    ],
+                    "labels": [
+                        0
+                    ],
+                    "box": null
+                }
+            ]
+        },
+        {
+            "frame_idx": 98,
+            "groups": [
+                {
+                    "group_id": 1,
+                    "points": [
+                        [
+                            508.0,
+                            64.4
+                        ]
+                    ],
+                    "labels": [
+                        0
+                    ],
+                    "box": null
+                }
+            ]
+        },
+        {
+            "frame_idx": 101,
+            "groups": [
+                {
+                    "group_id": 1,
+                    "points": [
+                        [
+                            506.2,
+                            65.2
+                        ]
+                    ],
+                    "labels": [
+                        0
+                    ],
+                    "box": null
+                }
+            ]
+        },
+        {
+            "frame_idx": 113,
+            "groups": [
+                {
+                    "group_id": 0,
+                    "points": [
+                        [
+                            389.6,
+                            217.1
+                        ]
+                    ],
+                    "labels": [
+                        1
+                    ],
+                    "box": null
+                }
+            ]
+        },
+        {
+            "frame_idx": 138,
+            "groups": [
+                {
+                    "group_id": 0,
+                    "points": [
+                        [
+                            410.8,
+                            222.3
+                        ]
+                    ],
+                    "labels": [
+                        1
+                    ],
+                    "box": null
+                }
+            ]
+        },
+        {
+            "frame_idx": 149,
+            "groups": [
+                {
+                    "group_id": 1,
+                    "points": [
+                        [
+                            507.4,
+                            310.1
+                        ]
+                    ],
+                    "labels": [
+                        0
+                    ],
+                    "box": null
+                }
+            ]
+        },
+        {
+            "frame_idx": 156,
+            "groups": [
+                {
+                    "group_id": 1,
+                    "points": [
+                        [
+                            529.8,
+                            328.9
+                        ]
+                    ],
+                    "labels": [
+                        0
+                    ],
+                    "box": null
+                }
+            ]
+        },
+        {
+            "frame_idx": 169,
+            "groups": [
+                {
+                    "group_id": 0,
+                    "points": [
+                        [
+                            388.4,
+                            228.5
+                        ]
+                    ],
+                    "labels": [
+                        1
+                    ],
+                    "box": null
+                }
+            ]
+        },
+        {
+            "frame_idx": 189,
+            "groups": [
+                {
+                    "group_id": 0,
+                    "points": [
+                        [
+                            392.2,
+                            211.8
+                        ]
+                    ],
+                    "labels": [
+                        1
+                    ],
+                    "box": null
+                }
+            ]
+        },
+        {
+            "frame_idx": 207,
+            "groups": [
+                {
+                    "group_id": 2,
+                    "points": [
+                        [
+                            324.3,
+                            37.6
+                        ]
+                    ],
+                    "labels": [
+                        0
+                    ],
+                    "box": null
+                }
+            ]
+        },
+        {
+            "frame_idx": 214,
+            "groups": [
+                {
+                    "group_id": 0,
+                    "points": [
+                        [
+                            397.1,
+                            222.4
+                        ]
+                    ],
+                    "labels": [
+                        1
+                    ],
+                    "box": null
+                }
+            ]
+        },
+        {
+            "frame_idx": 214,
+            "groups": [
+                {
+                    "group_id": 2,
+                    "points": [
+                        [
+                            298.1,
+                            26.2
+                        ]
+                    ],
+                    "labels": [
+                        0
+                    ],
+                    "box": null
+                }
+            ]
+        },
+        {
+            "frame_idx": 221,
+            "groups": [
+                {
+                    "group_id": 2,
+                    "points": [
+                        [
+                            312.9,
+                            22.3
+                        ]
+                    ],
+                    "labels": [
+                        0
+                    ],
+                    "box": null
+                }
+            ]
+        },
+        {
+            "frame_idx": 230,
+            "groups": [
+                {
+                    "group_id": 0,
+                    "points": [
+                        [
+                            377.1,
+                            250.5
+                        ]
+                    ],
+                    "labels": [
+                        1
+                    ],
+                    "box": null
+                }
+            ]
+        },
+        {
+            "frame_idx": 238,
+            "groups": [
+                {
+                    "group_id": 0,
+                    "points": [
+                        [
+                            381.3,
+                            216.2
+                        ]
+                    ],
+                    "labels": [
+                        1
+                    ],
+                    "box": null
+                }
+            ]
+        }
+    ]
+}
