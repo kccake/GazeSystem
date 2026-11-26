@@ -163,9 +163,22 @@ class VideoSessionServiceBase:
 
     @staticmethod
     def _check_stream_prompt_frame(session: VideoSession, frame_idx: int) -> None:
-        if session.is_streaming and frame_idx != session.received_frame_count - 1:
-            raise ValueError("流式模式只能给最新收到的帧加提示") # 检查该帧是否为最新一帧
-
+        """
+        流式提示帧合法性: 提示必须落在"已入库或可入库"的帧上
+        - frame_idx > 最新收到帧: 帧不存在, 拒绝
+        - frame_idx 在已推入底层(stream_c2s 中): 合法, 作为条件帧参与追踪
+        - frame_idx == 最新收到帧(未推入): 合法, _ensure_prompt_frame_pushed 补推
+        """
+        if not session.is_streaming:
+            return
+        latest = session.received_frame_count - 1
+        if frame_idx < 0 or frame_idx > latest:
+            raise ValueError(f"帧 {frame_idx} 尚未收到(最新为 {latest})")
+        if frame_idx < latest and frame_idx not in session.stream_c2s:
+            raise ValueError(
+                f"帧 {frame_idx} 未入库且无法补推: 流式下只有网格帧和被提示的帧"
+                f"会推入底层, 该帧的图像数据已随新帧到达被丢弃; "
+                f"请给最新帧(第 {latest} 帧)或已入库的帧加提示")
 
     def _ensure_prompt_frame_pushed(self, session: VideoSession, frame_idx: int) -> None:
         """
@@ -359,6 +372,8 @@ class VideoSessionServiceBase:
         )
         if chunk_iter is not None:
             session = self.session_manager.get_video_session(sid) # 开始将帧分批入库
+            if session is None:
+                raise ValueError(f"会话 {sid} 不存在")
             for chunk in chunk_iter:
                 out = self.compute_engine.add_video_frames(session.video_session, chunk)
                 session.original_size = out["original_size"]
