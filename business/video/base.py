@@ -165,18 +165,18 @@ class VideoSessionServiceBase:
     def _check_stream_prompt_frame(session: VideoSession, frame_idx: int) -> None:
         """
         流式提示帧合法性: 提示必须落在"已入库或可入库"的帧上
-        - frame_idx > 最新收到帧: 帧不存在, 拒绝
+        - frame_idx > 最新收到帧(latest_frame_idx): 帧不存在, 拒绝
         - frame_idx 在已推入底层(stream_c2s 中): 合法, 作为条件帧参与追踪
         - frame_idx == 最新收到帧(未推入): 合法, _ensure_prompt_frame_pushed 补推
         """
         if not session.is_streaming:
             return
-        latest = session.received_frame_count - 1
+        latest = session.latest_frame_idx
         if frame_idx < 0 or frame_idx > latest:
             raise ValueError(f"帧 {frame_idx} 尚未收到(最新为 {latest})")
         if frame_idx < latest and frame_idx not in session.stream_c2s:
             raise ValueError(
-                f"帧 {frame_idx} 未入库且无法补推: 流式下只有网格帧和被提示的帧"
+                f"帧 {frame_idx} 未入库且无法补推: 流式下只有被追踪的帧和被提示的帧"
                 f"会推入底层, 该帧的图像数据已随新帧到达被丢弃; "
                 f"请给最新帧(第 {latest} 帧)或已入库的帧加提示")
 
@@ -192,12 +192,13 @@ class VideoSessionServiceBase:
         """
         if not session.is_streaming or frame_idx in session.stream_c2s:
             return  # 离线无需补推; 已推入底层的帧直接返回, 如果在session.stream_c2s, 则意味着该帧已经被推入底层
-        if frame_idx != session.received_frame_count - 1:
-            # 契约: 只能补推最新收到的帧(底层只能顺序接帧)
+        if frame_idx != session.latest_frame_idx:
+            # 契约: 只能补推最新收到的帧(底层只能顺序接帧, last_frame 只缓存一帧像素)
             raise ValueError(
                 f"只能补推最新帧: frame_idx={frame_idx}, "
-                f"最新={session.received_frame_count - 1}")
-        self._push_streaming_frame(session, session.last_frame, track=False) # 补推只注册帧，之后照旧 _flush_dirty_frame → _compute_and_cache，只追踪一次
+                f"最新={session.latest_frame_idx}")
+        self._push_streaming_frame(session, session.last_frame, session.latest_frame_idx,
+                                   track=False) # 补推只注册帧，之后照旧 _flush_dirty_frame → _compute_and_cache，只追踪一次
 
     # ========== 提示操作(离线/流式共用) ==========
     def add_video_point(self, session_id: str, group_id: int,
@@ -323,6 +324,7 @@ class VideoSessionServiceBase:
         session.group_first_frame.clear()
         session.anchor_frame = None
         session.last_computed_frame = None
+        session.frames_since_track = 0    # 门控计数随追踪状态重置(EMA 保留, 速率特征不变)
         return {"success": True, "message": "追踪状态已重置, 帧入库状态保留"}
 
     def close_video_session(self, session_id: str) -> Dict:
@@ -392,7 +394,7 @@ class VideoSessionServiceBase:
         提示帧自动成为关键帧; 起算点之前的提示帧先补算(lead), 让提示进入追踪记忆
         """
         session = self._get_video_session(session_id)
-        max_frame = (session.received_frame_count - 1) if session.is_streaming \
+        max_frame = session.latest_frame_idx if session.is_streaming \
             else session.frame_count - 1
         if max_frame < 0:
             raise ValueError("还没有可计算的帧")
@@ -440,9 +442,14 @@ class VideoSessionServiceBase:
         #   3. 删除提示帧后相位是否回退需要定义清楚
         # 结论: v1 保留固定锚+事件帧(行为已正确), 此为 v2 候选, 改动前需过一遍上面三点
 
-        # 计算计划 = 网格帧 ∪ 范围内的提示帧; lead = 起点之前的提示帧(先补算, 让提示进入记忆)
-        plan = sorted({f for f in range(f0, end + 1) if (f - anchor) % session.frame_stride == 0}
-                      | {f for f in prompt_frames if f0 <= f <= end})
+        # 计算计划 = 范围内"可计算帧"∪提示帧; lead = 起点之前的提示帧(先补算, 让提示进入记忆)
+        # 离线: 帧号连续, 取模网格(锚点网格); 流式: 已入库帧(stream_c2s 键, 天然容忍丢帧空洞)
+        if session.is_streaming:
+            plan = sorted({f for f in session.stream_c2s if f0 <= f <= end}
+                          | {f for f in prompt_frames if f0 <= f <= end})
+        else:
+            plan = sorted({f for f in range(f0, end + 1) if (f - anchor) % session.frame_stride == 0}
+                          | {f for f in prompt_frames if f0 <= f <= end})
         lead = [f for f in prompt_frames if f < f0] # 当显式指定的start_frame越过了某些提示帧时, 比如提示在第3帧, 但是只要10-20帧的结果， 这样的话第3帧的提示就无法输入了, 所以要加lead
 
         # 取消传播计算

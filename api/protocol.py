@@ -13,6 +13,8 @@ WS 二进制消息(服务端 -> 客户端): 掩码包 mask bundle
       ...  png 字节(单通道 L, 0/255 二值)
 
 图像载荷(双向): PNG/JPEG 字节, 直接编解码, 无额外包头
+推帧载荷(客户端 -> 服务端): 4 字节帧号头(大端) + 图像字节,
+  见 pack_push_frame / unpack_push_frame; 旧客户端发裸图像字节(无头), 兼容期内允许
 文本消息(双向): JSON, 命令与事件, 见 server.py / client.py
 """
 
@@ -29,6 +31,7 @@ MSG_MASK_BUNDLE = 1
 
 _HEADER = struct.Struct("<BIfI")
 _GROUP = struct.Struct("<II")
+_PUSH_HDR = struct.Struct(">I")   # 推帧帧号头(大端 4 字节)
 
 
 def mask_to_png(mask: "torch.Tensor") -> bytes:
@@ -74,6 +77,25 @@ def encode_image(img: Image.Image, fmt: str = "PNG") -> bytes:
     buf = io.BytesIO()
     img.save(buf, format=fmt)
     return buf.getvalue()
+
+
+def pack_push_frame(frame_idx: int, payload: bytes) -> bytes:
+    """推帧消息 = 4 字节帧号头(大端) + 图像字节; 帧号由客户端编号, 服务端不再靠数消息推断"""
+    return _PUSH_HDR.pack(frame_idx) + payload
+
+
+def unpack_push_frame(data: bytes) -> Tuple[Optional[int], bytes]:
+    """
+    解推帧消息 -> (frame_idx, 图像字节); 旧客户端(裸图像字节)返回 (None, data)
+    新旧协议靠魔数区分且永不冲突: 裸 JPEG=FF D8 / PNG=89 50 4E 47 开头,
+    而帧号头前两字节 = idx >> 16, 需 idx >= 0xFFD80000(约 43 亿帧)才会撞 JPEG 魔数
+    TODO(v2 UI 落地后): 删除旧协议兼容分支, 一律按带头解析
+    """
+    if data[:2] == b"\xff\xd8" or data[:4] == b"\x89PNG":
+        return None, data
+    if len(data) < _PUSH_HDR.size:
+        raise ValueError("推帧消息过短(不足 4 字节帧号头)")
+    return _PUSH_HDR.unpack_from(data, 0)[0], data[_PUSH_HDR.size:]
 
 
 def decode_image(data: bytes) -> Image.Image:

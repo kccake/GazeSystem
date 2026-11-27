@@ -26,9 +26,17 @@ from fastapi.responses import JSONResponse, Response
 from PIL import Image
 
 from ..business.service_layer import SAM3ServiceLayer
-from .protocol import decode_image, pack_mask_bundle
+from .protocol import decode_image, pack_mask_bundle, unpack_push_frame
 
 logger = logging.getLogger(__name__)
+
+# 推帧合并 drain 的等待窗口: 处理完一帧后, 把已到达的后续消息收干,
+# 推帧只保留最新(其余丢弃计数), 夹在中间的文本命令按到达顺序照常执行
+_DRAIN_TIMEOUT_S = 0.002
+
+
+class _ClientGone(Exception):
+    """drain 过程中收到 websocket.disconnect"""
 
 # 现在decode_video_bytes这个被放在了服务层, 
 # 因为要去逐chunk解码视频，需要在api层无感知, 不关心业务细节
@@ -274,6 +282,27 @@ class VideoWsHandler:
         else:
             self._emit_json(result)
 
+    async def _coalesce_push_frames(self, msg: Dict) -> tuple:
+        """
+        有界合并缓冲: drain 已到达的后续消息, 推帧只保留最新(旧帧丢弃并计数),
+        夹在中间的文本命令按到达顺序照常执行(命令彼此保序)
+        有界性: 积压上限 = 到达率 × 单帧处理耗时(物理有界), 丢弃帧号由协议显式化
+        """
+        dropped = 0
+        while True:
+            try:
+                nxt = await asyncio.wait_for(self.ws.receive(), timeout=_DRAIN_TIMEOUT_S)
+            except asyncio.TimeoutError:
+                break
+            if nxt["type"] == "websocket.disconnect":
+                raise _ClientGone()
+            if nxt.get("bytes") is not None:
+                dropped += 1
+                msg = nxt          # 旧帧被新帧顶替, 只留最新
+            else:
+                await self._handle_command(json.loads(nxt["text"]))
+        return msg, dropped
+
     async def run(self) -> None:
         sender = asyncio.create_task(self._sender())
         try:
@@ -282,13 +311,20 @@ class VideoWsHandler:
                 if msg["type"] == "websocket.disconnect":
                     break
                 if msg.get("bytes") is not None:
-                    # 二进制上行 = 推帧(JPEG/PNG 图像字节)
+                    # 二进制上行 = 推帧(4 字节帧号头 + 图像字节; 旧协议裸图像见 unpack_push_frame)
                     try:
-                        frame = decode_image(msg["bytes"])
+                        msg, dropped = await self._coalesce_push_frames(msg)
+                        frame_idx, payload = unpack_push_frame(msg["bytes"])
+                        frame = decode_image(payload)
                         async with self.cmd_lock:
                             result = await self.loop.run_in_executor(
-                                None, self.service.push_video_frame, self.sid, frame)
+                                None, self.service.push_video_frame,
+                                self.sid, frame, frame_idx)
+                        if dropped:
+                            result.setdefault("flow", {})["transport_dropped"] = dropped
                         self._emit_result(result)
+                    except _ClientGone:
+                        break
                     except Exception as e:
                         self._emit_error(e)
                     continue

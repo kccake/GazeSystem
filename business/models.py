@@ -159,6 +159,14 @@ class VideoSession:
     stream_c2s: Dict[int, int] = field(default_factory=dict)  # 客户端帧号 -> session 帧号
     stream_s2c: Dict[int, int] = field(default_factory=dict)  # session 帧号 -> 客户端帧号
 
+    # ---- 流式拥塞控制(有界合并 + 计数器门控 + flow 观测) ----
+    latest_frame_idx: int = -1                 # 最新收到的客户端帧号(显式记录, 容忍跳帧空洞)
+    frames_since_track: int = 0                # 距上次追踪的帧计数(门控用, 取代 %stride 取模, 无相位问题)
+    gate_dropped_count: int = 0                # 门控丢弃累计(未入库, 复用前序结果, 可观测)
+    last_arrival_ts: Optional[float] = None    # 上一帧到达时刻(单调时钟)
+    ema_arrival_ms: Optional[float] = None     # 到达间隔 EMA -> 输入速率(flow 上报)
+    ema_proc_ms: Optional[float] = None        # 追踪耗时 EMA -> 处理速率(flow 上报)
+
     # 传播取消信号, 中途取消一段长传播的线程安全信号
     # 当前端点取消后, 能够立即停下来, 不再算下一个关键帧
     cancel_event: threading.Event = field(default_factory=threading.Event)

@@ -252,15 +252,19 @@ def test_streaming():
     r4 = svc.push_video_frame(sid, Image.new("RGB", (16, 16)))
     assert r4["keyframe"] is True and r4["frame_idx"] == 4
 
-    # 非最新帧加提示 -> 拒绝
+    # 校验放宽(bc76612): 已入库的旧帧(关键帧2)可以补提示
+    r = svc.add_video_point(sid, group_id=1, x=1, y=1, label=1, frame_idx=2)
+    assert r["computed"] and r["groups"] == [1]
+
+    # 未入库的旧帧(3, 网格/门控丢弃, 像素已丢弃)加提示 -> 拒绝
     try:
-        svc.add_video_point(sid, group_id=1, x=1, y=1, label=1, frame_idx=2)
-        raise AssertionError("非最新帧加提示应抛 ValueError")
+        svc.add_video_point(sid, group_id=2, x=2, y=2, label=1, frame_idx=3)
+        raise AssertionError("未入库旧帧加提示应抛 ValueError")
     except ValueError:
         pass
 
     # 最新帧加提示(帧4已推入, 直接 flush + 计算)
-    r = svc.add_video_point(sid, group_id=1, x=1, y=1, label=1, frame_idx=4)
+    r = svc.add_video_point(sid, group_id=1, x=5, y=5, label=1, frame_idx=4)
     assert r["computed"] and r["groups"] == [1]
 
     r5 = svc.push_video_frame(sid, Image.new("RGB", (16, 16)))
@@ -268,6 +272,54 @@ def test_streaming():
     r6 = svc.push_video_frame(sid, Image.new("RGB", (16, 16)))
     assert r6["keyframe"] is True and r6["groups"] == [1]
     print("PASS test_streaming")
+
+
+def test_streaming_explicit_frame_idx():
+    """显式客户端帧号: 跳帧空洞容忍/latest 语义/空洞帧拒绝/已入库帧可提示/计划只遍历已入库帧"""
+    svc = make_service()
+    sid = svc.create_video_session(video_frames=None, frame_stride=1, auto_predict=True)
+    img = Image.new("RGB", (16, 16))
+    svc.push_video_frame(sid, img, client_idx=0)
+    svc.push_video_frame(sid, img, client_idx=1)
+    r4 = svc.push_video_frame(sid, img, client_idx=4)   # 2,3 模拟传输层合并丢弃(跳帧空洞)
+    assert r4["frame_idx"] == 4 and r4["keyframe"] is True
+    sess = svc.session_manager.get_video_session(sid)
+    assert sess.latest_frame_idx == 4
+    assert sess.stream_c2s == {0: 0, 1: 1, 4: 2}, \
+        f"底层帧号应连续, 客户端帧号有空洞: {sess.stream_c2s}"
+
+    # 空洞帧 3(未入库, 像素已丢弃)加提示 -> 拒绝
+    try:
+        svc.add_video_point(sid, group_id=1, x=1, y=1, label=1, frame_idx=3)
+        raise AssertionError("空洞帧加提示应抛 ValueError")
+    except ValueError:
+        pass
+    # 已入库的旧帧 1 加提示 -> 合法
+    r = svc.add_video_point(sid, group_id=1, x=1, y=1, label=1, frame_idx=1)
+    assert r["computed"] and r["groups"] == [1]
+
+    # submit 计划只遍历已入库帧 ∪ 提示帧, 空洞帧 2,3 不在计划里也不炸
+    events = list(svc.submit_video_prompts(sid, start_frame=0, end_frame=4))
+    kf = [e["frame_idx"] for e in events if e["type"] == "keyframe"]
+    assert kf == [0, 1, 4], f"流式计划应只含已入库帧∪提示帧(容忍空洞): {kf}"
+    print("PASS test_streaming_explicit_frame_idx")
+
+
+def test_streaming_gate_drop_stats():
+    """计数器门控: 静态 frame_stride 下行为等同旧取模网格, 丢弃入账, flow 观测随结果上报"""
+    svc = make_service()
+    sid = svc.create_video_session(video_frames=None, frame_stride=3, auto_predict=True)
+    img = Image.new("RGB", (16, 16))
+    rs = [svc.push_video_frame(sid, img) for _ in range(6)]
+    # track: 0,3; 门控丢弃: 1,2,4,5
+    assert [r["keyframe"] for r in rs] == [True, False, False, True, False, False], \
+        f"门控序列错误: {[r['keyframe'] for r in rs]}"
+    sess = svc.session_manager.get_video_session(sid)
+    assert sess.gate_dropped_count == 4, sess.gate_dropped_count
+    flow = rs[-1]["flow"]
+    assert flow["stride"] == 3 and flow["gate_dropped"] == 4, flow
+    assert flow["ema_arrival_ms"] is not None and rs[0]["flow"]["ema_proc_ms"] is not None
+    print("PASS test_streaming_gate_drop_stats")
 
 
 def test_cancel_and_reset():

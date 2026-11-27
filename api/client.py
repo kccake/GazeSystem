@@ -15,7 +15,8 @@ from typing import Dict, Generator, Optional
 import requests
 from PIL import Image
 
-from .protocol import (encode_image, png_bytes_to_image, unpack_mask_bundle)
+from .protocol import (encode_image, pack_push_frame, png_bytes_to_image,
+                       unpack_mask_bundle)
 
 
 class ApiError(RuntimeError):
@@ -160,9 +161,17 @@ class VideoChannel:
         return ev
 
     # ---- 推帧 ----
-    def push_frame(self, frame: Image.Image, fmt: str = "JPEG") -> Dict:
-        """流式推一帧(二进制上行), 返回该帧结果事件"""
-        self.ws.send(encode_image(frame, fmt))
+    def push_frame(self, frame: Image.Image, frame_idx: Optional[int] = None,
+                   fmt: str = "JPEG") -> Dict:
+        """
+        流式推一帧(二进制上行), 返回该帧结果事件
+        frame_idx 给出时消息带 4 字节帧号头(新协议, 跳帧由客户端显式化);
+        不给则发裸图像字节(旧协议, 服务端按到达顺序编号)
+        """
+        payload = encode_image(frame, fmt)
+        if frame_idx is not None:
+            payload = pack_push_frame(frame_idx, payload)
+        self.ws.send(payload)
         return self.recv_event()
 
     # ---- 提示操作(每个命令对应一个结果事件) ----
